@@ -38,7 +38,6 @@
   let applying = false;             // 正在操作 DOM（MutationObserver 忽略）
   let observer = null;              // MutationObserver
   let completeTimer = null;          // 空闲完成定时器
-  let qualityRetries = 0;            // 质量检查重试次数
 
   // ---- 页面内浮动状态组件 ----
   let widget = null;
@@ -444,7 +443,6 @@
 
     translating = true;
     doneIndices = new Set();
-    qualityRetries = 0;
     clearTimeout(completeTimer);
     completeTimer = null;
     startObserver();
@@ -543,50 +541,6 @@
     if (map.size) saveCache(map);
   }
 
-  // LLM 翻译质量检查：抽样审核，有问题的重新翻译
-  async function runQualityCheck() {
-    const sampleSize = Math.min(10, pendingBlocks.length);
-    if (!sampleSize) return false; // 无内容可检查
-
-    // 随机抽样
-    const step = Math.max(1, Math.floor(pendingBlocks.length / sampleSize));
-    const sample = [];
-    for (let i = 0; i < pendingBlocks.length && sample.length < sampleSize; i += step) {
-      const block = pendingBlocks[i];
-      if (!block.node || !document.contains(block.node)) continue;
-      sample.push({
-        index: i,
-        original: block.text,
-        translated: block.node.textContent.trim(),
-      });
-    }
-    if (!sample.length) return false;
-
-    try {
-      const result = await chrome.runtime.sendMessage({
-        type: 'QUALITY_CHECK',
-        sample,
-      });
-
-      if (!result?.issues?.length) return false; // 质量通过
-
-      // 有问题的块重新翻译
-      showWidget('working', `质量修复 ${result.issues.length} 项...`);
-      const badBlocks = result.issues
-        .filter(i => i >= 0 && i < pendingBlocks.length && document.contains(pendingBlocks[i].node))
-        .map(i => pendingBlocks[i]);
-
-      if (!badBlocks.length) return false;
-
-      const items = buildSendItems(badBlocks);
-      translating = true;
-      await chrome.runtime.sendMessage({ type: 'TRANSLATE', items });
-      return true; // 已触发重新翻译
-    } catch {
-      return false;
-    }
-  }
-
   async function translateIncremental(groups) {
     if (translating) return;
     clearTimeout(completeTimer);
@@ -650,26 +604,15 @@
         const cancelled = msg.data?.cancelled;
         clearTimeout(completeTimer);
         if (cancelled) {
-          // 用户取消，不跑质量检查，直接释放
           translating = false;
           break;
         }
         if (!translated) {
-          // 保持 translating=true 锁住，防止质量检查期间侧栏等动态内容触发并发翻译
-          if (qualityRetries < 1) {
-            qualityRetries++;
-            runQualityCheck().then(() => {
-              // 质量检查完成，释放锁并启动空闲计时器
-              translating = false;
-              completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
-            });
-          } else {
-            // 已重试过，不再检查，直接启动空闲计时器
-            translating = false;
-            completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
-          }
+          // 首次翻译完成，启动空闲计时器
+          translating = false;
+          completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
         } else {
-          // 增量翻译的 ALL_DONE（非首次），直接释放锁
+          // 增量翻译完成，直接释放锁
           translating = false;
         }
         break;
