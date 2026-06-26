@@ -266,11 +266,13 @@
     }
   }
 
-  function finalizeTranslation() {
-    isTranslated = true;
+  function finalizeTranslation(isIncremental) {
     isTranslating = false;
-    pendingBatches = [];
-    chrome.runtime.sendMessage({ type: 'TRANSLATION_DONE' });
+    if (!isIncremental) {
+      // 主翻译完成：标记已翻译，但不清空 pendingBatches（防止迟到的结果丢失）
+      isTranslated = true;
+      chrome.runtime.sendMessage({ type: 'TRANSLATION_DONE' });
+    }
   }
 
   // ============================================================
@@ -513,7 +515,8 @@
 
       // 所有批次完成
       case 'ALL_BATCHES_DONE': {
-        finalizeTranslation();
+        const { isIncremental } = message.data || {};
+        finalizeTranslation(isIncremental);
         break;
       }
 

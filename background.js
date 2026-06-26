@@ -63,9 +63,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'TRANSLATE_BATCHES': {
       const tabId = sender.tab?.id;
       const offset = data.offset || 0;
+      const isIncremental = offset > 0;
       // 立即返回确认，翻译结果通过 BATCH_RESULT / ALL_BATCHES_DONE 推送
       try {
-        const info = kickOffTranslation(data.batches, tabId, offset);
+        const info = kickOffTranslation(data.batches, tabId, offset, isIncremental);
         sendResponse(info);
       } catch (err) {
         sendResponse({ error: err.message });
@@ -106,7 +107,7 @@ async function handleToggleAuto() {
 // 翻译批次处理（核心）
 // ============================================================
 
-function kickOffTranslation(batches, tabId, offset = 0) {
+function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
   if (!state.apiKey) {
     throw new Error('请先配置 API Key');
   }
@@ -177,7 +178,7 @@ function kickOffTranslation(batches, tabId, offset = 0) {
     if (tabId) {
       chrome.tabs.sendMessage(tabId, {
         type: 'ALL_BATCHES_DONE',
-        data: { totalBatches, cancelled: state.cancelRequested },
+        data: { totalBatches, cancelled: state.cancelRequested, isIncremental },
       }).catch(() => {});
     }
 
@@ -219,7 +220,7 @@ async function translateOneBatch(batch, signal) {
             { role: 'user', content: prompt },
           ],
           temperature: 0.3,
-          stream: true,
+          stream: false,
         }),
         signal,
       });
@@ -231,8 +232,8 @@ async function translateOneBatch(batch, signal) {
         throw err;
       }
 
-      // 流式 SSE 解析
-      const content = await readSSEStream(response, signal);
+      const result = await response.json();
+      const content = result.choices?.[0]?.message?.content?.trim();
       if (!content) throw new Error('API 返回空内容');
 
       const translations = parseResponse(content, batch.length);
@@ -247,42 +248,6 @@ async function translateOneBatch(batch, signal) {
     }
   }
   throw lastError;
-}
-
-// SSE 流式读取：逐 chunk 拼接完整文本
-async function readSSEStream(response, signal) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let fullContent = '';
-
-  while (true) {
-    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // 保留不完整的行
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data: ')) continue;
-      const data = trimmed.slice(6);
-      if (data === '[DONE]') continue;
-
-      try {
-        const parsed = JSON.parse(data);
-        const delta = parsed.choices?.[0]?.delta?.content;
-        if (delta) fullContent += delta;
-      } catch (e) {
-        // 忽略不完整的 JSON
-      }
-    }
-  }
-
-  return fullContent.trim();
 }
 
 // ============================================================
