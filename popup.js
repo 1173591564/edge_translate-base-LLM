@@ -153,7 +153,6 @@ els.translateBtn.addEventListener('click', async () => {
     // 取消翻译
     await sendBg('CANCEL_TRANSLATE');
     isTranslating = false;
-    setStatus('已取消翻译', 'warning');
     updateUI();
     return;
   }
@@ -175,10 +174,9 @@ els.translateBtn.addEventListener('click', async () => {
       return;
     }
 
-    // START_TRANSLATE 立即返回，翻译在后台渐进式进行
-    // 结果通过 PROGRESS_UPDATE 和 TRANSLATION_DONE 消息异步推送
     if (result.ok) {
-      setStatus(`正在翻译... 0%（${result.batchCount} 个批次）`, '');
+      // 翻译已启动，结果通过 TRANSLATION_COMPLETE 消息通知
+      setStatus(`正在翻译... 0%（${result.batchCount} 批）`, '');
     }
   } catch (err) {
     isTranslating = false;
@@ -215,7 +213,7 @@ chrome.runtime.onMessage.addListener((message) => {
     setStatus(`正在翻译... ${percent}%（${completed}/${total} 批）`, '');
   }
 
-  if (message.type === 'TRANSLATION_DONE') {
+  if (message.type === 'TRANSLATION_COMPLETE') {
     isTranslating = false;
     isTranslated = true;
     setProgress(100);

@@ -60,11 +60,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       handleToggleAuto().then(result => sendResponse(result));
       return true;
 
-    case 'TRANSLATE_BATCHES':
-      handleTranslateBatches(data.batches, sender.tab?.id)
-        .then(results => sendResponse(results))
-        .catch(err => sendResponse({ error: err.message }));
-      return true;
+    case 'TRANSLATE_BATCHES': {
+      const tabId = sender.tab?.id;
+      const offset = data.offset || 0;
+      // 立即返回确认，翻译结果通过 BATCH_RESULT / ALL_BATCHES_DONE 推送
+      try {
+        const info = kickOffTranslation(data.batches, tabId, offset);
+        sendResponse(info);
+      } catch (err) {
+        sendResponse({ error: err.message });
+      }
+      break;
+    }
 
     case 'CANCEL_TRANSLATE':
       if (currentAbortController) {
@@ -99,7 +106,7 @@ async function handleToggleAuto() {
 // 翻译批次处理（核心）
 // ============================================================
 
-async function handleTranslateBatches(batches, tabId) {
+function kickOffTranslation(batches, tabId, offset = 0) {
   if (!state.apiKey) {
     throw new Error('请先配置 API Key');
   }
@@ -108,9 +115,8 @@ async function handleTranslateBatches(batches, tabId) {
   state.cancelRequested = false;
   currentAbortController = new AbortController();
 
-  let completedCount = 0;
-  let failedCount = 0;
   const totalBatches = batches.length;
+  let completedCount = 0;
 
   // 信号量控制并发
   const semaphore = {
@@ -133,42 +139,57 @@ async function handleTranslateBatches(batches, tabId) {
     },
   };
 
-  const tasks = batches.map(async (batch, batchIndex) => {
-    await semaphore.acquire();
-    try {
-      if (state.cancelRequested) return;
+  // 异步执行所有批次，逐批推送结果到 content.js
+  (async () => {
+    const tasks = batches.map(async (batch, batchIndex) => {
+      await semaphore.acquire();
+      try {
+        if (state.cancelRequested) return;
 
-      const translated = await translateOneBatch(batch, currentAbortController.signal);
+        const translated = await translateOneBatch(batch, currentAbortController.signal);
 
-      // 立即推送单批结果到 content script（渐进式渲染）
-      chrome.tabs.sendMessage(tabId, {
-        type: 'BATCH_RESULT',
-        data: { batchIndex, result: translated },
-      }).catch(() => {});
+        // 逐批推送翻译结果到 content.js（渐进式 DOM 替换）
+        if (tabId) {
+          chrome.tabs.sendMessage(tabId, {
+            type: 'BATCH_RESULT',
+            data: { batchIndex: batchIndex + offset, translations: translated.translations },
+          }).catch(() => {});
+        }
 
-      completedCount++;
-      broadcastProgress(completedCount, totalBatches);
-    } catch (err) {
-      if (err.name === 'AbortError') return;
-      console.error(`[Translate] Batch ${batchIndex} failed:`, err);
-      failedCount++;
-      completedCount++;
-      broadcastProgress(completedCount, totalBatches);
-    } finally {
-      semaphore.release();
-    }
-  });
+        completedCount++;
+        broadcastProgress(completedCount, totalBatches);
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        console.error(`[Translate] Batch ${batchIndex} failed:`, err);
+        completedCount++;
+        broadcastProgress(completedCount, totalBatches);
+      } finally {
+        semaphore.release();
+      }
+    });
 
-  try {
     await Promise.allSettled(tasks);
-  } catch (e) {
-    // 忽略（各任务内部已处理）
-  }
 
-  state.translating = false;
-  currentAbortController = null;
+    state.translating = false;
+    currentAbortController = null;
 
-  return { done: true, cancelled: state.cancelRequested, failedCount };
+    // 通知 content.js 所有批次完成
+    if (tabId) {
+      chrome.tabs.sendMessage(tabId, {
+        type: 'ALL_BATCHES_DONE',
+        data: { totalBatches, cancelled: state.cancelRequested },
+      }).catch(() => {});
+    }
+
+    // 通知 Popup 翻译完成
+    chrome.runtime.sendMessage({
+      type: 'TRANSLATION_COMPLETE',
+      data: { cancelled: state.cancelRequested },
+    }).catch(() => {});
+  })();
+
+  // 立即返回批次总数
+  return { ok: true, totalBatches };
 }
 
 // ============================================================
@@ -198,7 +219,7 @@ async function translateOneBatch(batch, signal) {
             { role: 'user', content: prompt },
           ],
           temperature: 0.3,
-          stream: false,
+          stream: true,
         }),
         signal,
       });
@@ -210,8 +231,8 @@ async function translateOneBatch(batch, signal) {
         throw err;
       }
 
-      const result = await response.json();
-      const content = result.choices?.[0]?.message?.content?.trim();
+      // 流式 SSE 解析
+      const content = await readSSEStream(response, signal);
       if (!content) throw new Error('API 返回空内容');
 
       const translations = parseResponse(content, batch.length);
@@ -219,7 +240,6 @@ async function translateOneBatch(batch, signal) {
     } catch (err) {
       lastError = err;
       if (err.name === 'AbortError') throw err;
-      // 401 不重试（Key 问题）
       if (err.status === 401) throw err;
       if (attempt < MAX_RETRIES) {
         await sleep(RETRY_DELAY_MS * (attempt + 1));
@@ -227,6 +247,42 @@ async function translateOneBatch(batch, signal) {
     }
   }
   throw lastError;
+}
+
+// SSE 流式读取：逐 chunk 拼接完整文本
+async function readSSEStream(response, signal) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullContent = '';
+
+  while (true) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // 保留不完整的行
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      const data = trimmed.slice(6);
+      if (data === '[DONE]') continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (delta) fullContent += delta;
+      } catch (e) {
+        // 忽略不完整的 JSON
+      }
+    }
+  }
+
+  return fullContent.trim();
 }
 
 // ============================================================
