@@ -540,6 +540,50 @@
     if (map.size) saveCache(map);
   }
 
+  // LLM 翻译质量检查：抽样审核，有问题的重新翻译
+  async function runQualityCheck() {
+    const sampleSize = Math.min(10, pendingBlocks.length);
+    if (!sampleSize) return false; // 无内容可检查
+
+    // 随机抽样
+    const step = Math.max(1, Math.floor(pendingBlocks.length / sampleSize));
+    const sample = [];
+    for (let i = 0; i < pendingBlocks.length && sample.length < sampleSize; i += step) {
+      const block = pendingBlocks[i];
+      if (!block.node || !document.contains(block.node)) continue;
+      sample.push({
+        index: i,
+        original: block.text,
+        translated: block.node.textContent.trim(),
+      });
+    }
+    if (!sample.length) return false;
+
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: 'QUALITY_CHECK',
+        sample,
+      });
+
+      if (!result?.issues?.length) return false; // 质量通过
+
+      // 有问题的块重新翻译
+      showWidget('working', `质量修复 ${result.issues.length} 项...`);
+      const badBlocks = result.issues
+        .filter(i => i >= 0 && i < pendingBlocks.length && document.contains(pendingBlocks[i].node))
+        .map(i => pendingBlocks[i]);
+
+      if (!badBlocks.length) return false;
+
+      const items = buildSendItems(badBlocks);
+      translating = true;
+      await chrome.runtime.sendMessage({ type: 'TRANSLATE', items });
+      return true; // 已触发重新翻译
+    } catch {
+      return false;
+    }
+  }
+
   async function translateIncremental(groups) {
     if (translating) return;
     // 有新内容→取消空闲完成计时，切回“翻译中”
@@ -598,10 +642,15 @@
 
       case 'ALL_DONE': {
         translating = false;
-        // 不立即标记完成，启动空闲计时器（3秒无新内容→完成）
         clearTimeout(completeTimer);
         if (!translated) {
-          completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
+          // 首次翻译完成→先做质量检查，再启动空闲计时器
+          runQualityCheck().then(fixed => {
+            // 质量检查完成（无论是否修复），启动空闲计时器
+            if (!translating) {
+              completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
+            }
+          });
         }
         break;
       }

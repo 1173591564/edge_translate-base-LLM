@@ -33,6 +33,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       ready.then(() => translateStream(msg.items, tabId));
       sendResponse({ ok: true });
       return true;
+    case 'QUALITY_CHECK':
+      ready.then(() => checkQuality(msg.sample).then(r => sendResponse(r)));
+      return true;
     case 'CANCEL': {
       const ctrl = abortControllers.get(tabId);
       if (ctrl) ctrl.abort();
@@ -152,6 +155,43 @@ async function translateStream(items, tabId) {
 
   chrome.tabs.sendMessage(tabId, { type: 'ALL_DONE' }).catch(() => {});
   chrome.runtime.sendMessage({ type: 'TRANSLATION_COMPLETE' }).catch(() => {});
+}
+
+// ---- 翻译质量检查 ----
+async function checkQuality(sample) {
+  if (!apiKey || !sample?.length) return { issues: [] };
+  try {
+    const resp = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          {
+            role: 'system',
+            content:
+              '你是翻译质量审核员。检查以下英中翻译对，找出有问题的条目。\n' +
+              '问题类型：1)译文仍含大量英文 2)译文未翻译(与原文相同) 3)译文质量极差 4)标记«»丢失\n' +
+              '只输出有问题的编号，用逗号分隔。全部合格输出 NONE。\n' +
+              '不要输出任何其他内容。',
+          },
+          { role: 'user', content: sample.map(s => `[${s.index}] 原文: ${s.original}\n译文: ${s.translated}`).join('\n\n') },
+        ],
+        temperature: 0,
+        max_tokens: 200,
+      }),
+    });
+    const data = await resp.json();
+    const text = (data.choices?.[0]?.message?.content || '').trim();
+    if (!text || text === 'NONE' || text === 'none') return { issues: [] };
+    const indices = text.match(/\d+/g)?.map(Number) || [];
+    return { issues: indices };
+  } catch {
+    return { issues: [] };
+  }
 }
 
 // ---- 自动翻译 ----
