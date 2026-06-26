@@ -20,6 +20,8 @@
 
   const CJK_THRESHOLD = 0.35;
   const WATCHDOG_TIMEOUT = 5 * 60 * 1000;
+  const CACHE_TTL = 30 * 60 * 1000; // 30 分钟缓存过期
+  const CACHE_MAX_URLS = 50; // 最多缓存 50 个 URL
 
   // ============================================================
   // 状态
@@ -37,6 +39,118 @@
 
   // 扁平节点列表：pendingNodes[i] = { node, text }
   let pendingNodes = [];
+
+  // ============================================================
+  // 翻译缓存（按 URL 缓存，刷新/重进时直接恢复）
+  // ============================================================
+
+  function getCacheKey() {
+    // 简单 URL hash：用 location.href 去掉 hash 部分
+    const url = location.href.split('#')[0];
+    let hash = 0;
+    for (let i = 0; i < url.length; i++) {
+      hash = ((hash << 5) - hash + url.charCodeAt(i)) | 0;
+    }
+    return 'tlcache_' + Math.abs(hash);
+  }
+
+  async function loadTranslationCache() {
+    try {
+      const key = getCacheKey();
+      const result = await chrome.storage.local.get(key);
+      const cached = result[key];
+      if (!cached) return null;
+      if (Date.now() - cached.timestamp > CACHE_TTL) {
+        chrome.storage.local.remove(key);
+        return null;
+      }
+      return cached;
+    } catch (e) { return null; }
+  }
+
+  async function saveTranslationCache() {
+    try {
+      const translations = {};
+      for (const [node, originalText] of originalCache) {
+        const trimmed = originalText.trim();
+        if (trimmed.length >= 3) {
+          translations[trimmed] = node.textContent.trim();
+        }
+      }
+      if (Object.keys(translations).length === 0) return;
+
+      const key = getCacheKey();
+      await chrome.storage.local.set({
+        [key]: {
+          url: location.href.split('#')[0],
+          translations,
+          timestamp: Date.now(),
+        },
+      });
+
+      // 清理过期缓存（限制数量）
+      cleanupOldCaches();
+    } catch (e) { /* 存储满或失败，静默处理 */ }
+  }
+
+  async function cleanupOldCaches() {
+    try {
+      const all = await chrome.storage.local.get(null);
+      const caches = Object.entries(all)
+        .filter(([k, v]) => k.startsWith('tlcache_'))
+        .sort((a, b) => b[1].timestamp - a[1].timestamp);
+
+      // 删除超过上限的旧缓存
+      if (caches.length > CACHE_MAX_URLS) {
+        const toRemove = caches.slice(CACHE_MAX_URLS).map(([k]) => k);
+        // 也删除过期的
+        const expired = caches.filter(([, v]) => Date.now() - v.timestamp > CACHE_TTL);
+        expired.forEach(([k]) => {
+          if (!toRemove.includes(k)) toRemove.push(k);
+        });
+        if (toRemove.length > 0) {
+          await chrome.storage.local.remove(toRemove);
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 从缓存恢复翻译：返回 true 表示成功恢复
+  function applyCachedTranslations(cache) {
+    const translations = cache.translations;
+    const nodes = extractTextNodes();
+    let matched = 0;
+
+    _isApplyingDOM = true;
+    try {
+      for (const node of nodes) {
+        const text = node.textContent.trim();
+        const translated = translations[text];
+        if (translated && translated !== text) {
+          if (!originalCache.has(node)) {
+            originalCache.set(node, node.textContent);
+          }
+          const raw = node.textContent;
+          const leading = raw.match(/^\s*/)?.[0] || '';
+          const trailing = raw.match(/\s*$/)?.[0] || '';
+          node.textContent = leading + translated + trailing;
+          const parent = node.parentElement;
+          if (parent) {
+            parent.setAttribute('data-translated', 'true');
+            if (!parent.hasAttribute('data-original')) {
+              parent.setAttribute('data-original', originalCache.get(node));
+            }
+          }
+          recentTranslated.set(node, Date.now());
+          matched++;
+        }
+      }
+    } finally {
+      _isApplyingDOM = false;
+    }
+
+    return matched;
+  }
 
   // ============================================================
   // 语言检测
@@ -159,6 +273,10 @@
       }
       pendingNodes = [];
       cleanupDeadNodes();
+      // 保存翻译到缓存（仅主翻译成功时）
+      if (!cancelled && originalCache.size > 0) {
+        saveTranslationCache();
+      }
     }
 
     // 处理暂存的增量节点
@@ -219,6 +337,17 @@
     if (lang === 'empty') return { error: '未检测到可翻译的内容' };
 
     if (isTranslated) restoreOriginal();
+
+    // 尝试从缓存恢复翻译
+    const cache = await loadTranslationCache();
+    if (cache) {
+      const matched = applyCachedTranslations(cache);
+      if (matched > 0) {
+        isTranslated = true;
+        startObserver();
+        return { ok: true, nodeCount: matched, fromCache: true };
+      }
+    }
 
     isTranslating = true;
 
