@@ -5,7 +5,7 @@
 
 const API_URL = 'https://api.deepseek.com/chat/completions';
 const MODEL = 'deepseek-chat';
-const MAX_CONCURRENT = 3;
+const MAX_CONCURRENT = 5;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 1000;
 
@@ -108,8 +108,8 @@ async function handleTranslateBatches(batches, tabId) {
   state.cancelRequested = false;
   currentAbortController = new AbortController();
 
-  const results = [];
   let completedCount = 0;
+  let failedCount = 0;
   const totalBatches = batches.length;
 
   // 信号量控制并发
@@ -139,15 +139,19 @@ async function handleTranslateBatches(batches, tabId) {
       if (state.cancelRequested) return;
 
       const translated = await translateOneBatch(batch, currentAbortController.signal);
-      results[batchIndex] = translated;
-      completedCount++;
 
-      // 推送进度到 Popup
+      // 立即推送单批结果到 content script（渐进式渲染）
+      chrome.tabs.sendMessage(tabId, {
+        type: 'BATCH_RESULT',
+        data: { batchIndex, result: translated },
+      }).catch(() => {});
+
+      completedCount++;
       broadcastProgress(completedCount, totalBatches);
     } catch (err) {
       if (err.name === 'AbortError') return;
       console.error(`[Translate] Batch ${batchIndex} failed:`, err);
-      results[batchIndex] = { error: err.message };
+      failedCount++;
       completedCount++;
       broadcastProgress(completedCount, totalBatches);
     } finally {
@@ -164,7 +168,7 @@ async function handleTranslateBatches(batches, tabId) {
   state.translating = false;
   currentAbortController = null;
 
-  return { results, cancelled: state.cancelRequested };
+  return { done: true, cancelled: state.cancelRequested, failedCount };
 }
 
 // ============================================================

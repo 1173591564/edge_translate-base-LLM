@@ -19,7 +19,7 @@
     'BR', 'HR', 'IMG', 'META', 'LINK',
   ]);
 
-  const MAX_CHARS_PER_BATCH = 1500;
+  const MAX_CHARS_PER_BATCH = 3000;
   const CJK_THRESHOLD = 0.35;
 
   // ============================================================
@@ -36,6 +36,9 @@
   let isTranslated = false;
   let _isApplyingDOM = false; // MutationObserver 内部锁
   let observer = null;
+  let currentBatches = null; // 当前翻译批次引用（用于渐进式接收结果）
+  let appliedBatchCount = 0;
+  let totalBatchCount = 0;
   const recentTranslated = new Map(); // Node -> timestamp（循环保护）
 
   // ============================================================
@@ -342,41 +345,27 @@
       // 1. 提取文本节点
       const textNodes = extractTextNodes();
       if (textNodes.length === 0) {
+        isTranslating = false;
         return { error: '未检测到可翻译的英文内容' };
       }
 
       // 2. 分批
-      const batches = createBatches(textNodes);
-      const batchPayloads = batches.map(batch =>
+      currentBatches = createBatches(textNodes);
+      totalBatchCount = currentBatches.length;
+      appliedBatchCount = 0;
+
+      const batchPayloads = currentBatches.map(batch =>
         batch.map(item => ({ text: item.text })),
       );
 
-      // 3. 发送给 Background 翻译
-      const response = await chrome.runtime.sendMessage({
+      // 3. 发送给 Background（不等待结果，结果通过 BATCH_RESULT 消息渐进式返回）
+      chrome.runtime.sendMessage({
         type: 'TRANSLATE_BATCHES',
         data: { batches: batchPayloads },
       });
 
-      if (response.error) return { error: response.error };
-      if (response.cancelled) {
-        isTranslating = false;
-        // 已翻译的部分保留
-        if (originalCache.size > 0) isTranslated = true;
-        return { cancelled: true };
-      }
-
-      // 4. 应用翻译结果
-      applyTranslations(batches, response.results);
-
-      isTranslated = true;
-      isTranslating = false;
-
-      // Observer 已在翻译开始时启动，无需再次启动
-
-      // 通知 Background 翻译完成
-      chrome.runtime.sendMessage({ type: 'TRANSLATION_DONE' });
-
-      return { ok: true, nodeCount: textNodes.length, batchCount: batches.length };
+      // 立即返回，不阻塞。结果通过 BATCH_RESULT 消息逐批应用
+      return { ok: true, nodeCount: textNodes.length, batchCount: currentBatches.length };
     } catch (err) {
       isTranslating = false;
       if (originalCache.size > 0) isTranslated = true;
@@ -508,6 +497,24 @@
       case 'AUTO_TRANSLATE':
         startTranslation().then(result => sendResponse(result));
         return true;
+
+      case 'BATCH_RESULT': {
+        // 渐进式接收单批翻译结果，立即应用到 DOM
+        const { batchIndex, result } = message.data;
+        if (currentBatches && currentBatches[batchIndex] && result?.ok) {
+          applyTranslations([currentBatches[batchIndex]], [result]);
+          appliedBatchCount++;
+
+          // 所有批次完成
+          if (appliedBatchCount >= totalBatchCount) {
+            isTranslated = true;
+            isTranslating = false;
+            currentBatches = null;
+            chrome.runtime.sendMessage({ type: 'TRANSLATION_DONE' });
+          }
+        }
+        break;
+      }
 
       case 'GET_CONTENT_STATE':
         sendResponse({
