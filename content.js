@@ -38,6 +38,7 @@
   let applying = false;             // 正在操作 DOM（MutationObserver 忽略）
   let observer = null;              // MutationObserver
   let completeTimer = null;          // 空闲完成定时器
+  let qualityRetries = 0;            // 质量检查重试次数
 
   // ---- 页面内浮动状态组件 ----
   let widget = null;
@@ -443,6 +444,7 @@
 
     translating = true;
     doneIndices = new Set();
+    qualityRetries = 0;
     clearTimeout(completeTimer);
     completeTimer = null;
     startObserver();
@@ -528,6 +530,7 @@
 
   // 空闲超时后标记翻译完成
   function onTranslationIdle() {
+    translating = false; // 质量检查 + 空闲等待全部结束后释放锁
     translated = true;
     showWidget('done', '翻译完成 ✓');
     autoHideWidget();
@@ -641,16 +644,24 @@
       }
 
       case 'ALL_DONE': {
-        translating = false;
         clearTimeout(completeTimer);
         if (!translated) {
-          // 首次翻译完成→先做质量检查，再启动空闲计时器
-          runQualityCheck().then(fixed => {
-            // 质量检查完成（无论是否修复），启动空闲计时器
-            if (!translating) {
+          // 保持 translating=true 锁住，防止质量检查期间侧栏等动态内容触发并发翻译
+          if (qualityRetries < 1) {
+            qualityRetries++;
+            runQualityCheck().then(() => {
+              // 质量检查完成，释放锁并启动空闲计时器
+              translating = false;
               completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
-            }
-          });
+            });
+          } else {
+            // 已重试过，不再检查，直接启动空闲计时器
+            translating = false;
+            completeTimer = setTimeout(onTranslationIdle, IDLE_TIMEOUT);
+          }
+        } else {
+          // 增量翻译的 ALL_DONE（非首次），直接释放锁
+          translating = false;
         }
         break;
       }
