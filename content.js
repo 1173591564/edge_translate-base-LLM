@@ -398,6 +398,18 @@
         startTranslation().then(result => sendResponse(result));
         return true;
 
+      // DOM 稳定性检测：500ms 内 DOM 变化 < 3 次则认为页面已稳定
+      case 'CHECK_READY': {
+        let mutationCount = 0;
+        const tempObs = new MutationObserver(() => mutationCount++);
+        tempObs.observe(document.body, { childList: true, subtree: true });
+        setTimeout(() => {
+          tempObs.disconnect();
+          sendResponse({ ready: mutationCount < 3 });
+        }, 500);
+        return true;
+      }
+
       case 'CANCEL_TRANSLATE_CONTENT':
         clearTimeout(watchdogTimer);
         isTranslating = false;

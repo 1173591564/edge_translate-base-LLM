@@ -275,11 +275,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (autoTranslatedTabs.has(tabId)) return;
   autoTranslatedTabs.add(tabId);
   await saveAutoTranslatedTabs();
-  await sleep(1500);
+  // 等待页面 DOM 稳定后再触发翻译（而非固定延迟）
+  await waitForDomStable(tabId);
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' });
   } catch (e) {
-    // Content script 未就绪，重试一次
     await sleep(500);
     try { await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' }); } catch (e2) {}
   }
@@ -291,7 +291,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
   if (!state.autoTranslate || !state.apiKey) return;
   autoTranslatedTabs.delete(details.tabId);
   await saveAutoTranslatedTabs();
-  await sleep(1500);
+  await waitForDomStable(details.tabId);
   try {
     await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' });
   } catch (e) {
@@ -320,4 +320,16 @@ function broadcastProgress(completed, total, tabId, failedCount = 0) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 等待页面 DOM 稳定：先等 2 秒初始渲染，再检测 DOM 是否还在变化
+async function waitForDomStable(tabId) {
+  await sleep(2000);
+  for (let i = 0; i < 3; i++) {
+    try {
+      const result = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_READY' });
+      if (result?.ready) break;
+    } catch (e) { break; }
+    await sleep(1000);
+  }
 }
