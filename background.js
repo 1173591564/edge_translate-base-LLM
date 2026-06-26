@@ -215,7 +215,7 @@ function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
 // ============================================================
 
 async function translateOneBatch(batch, signal) {
-  const textArray = batch.map((item, i) => `[i:${i}] ${item.text}`);
+  const textArray = batch.map((item, i) => `[${i}] ${item.text}`);
   const prompt = buildPrompt(textArray);
 
   let lastError;
@@ -232,16 +232,16 @@ async function translateOneBatch(batch, signal) {
           messages: [
             {
               role: 'system',
-              content: '你是专业的英中翻译引擎。将用户提供的英文文本翻译为中文，输出 JSON 格式。' +
-                       'JSON 格式为：{"translations":[{"i":0,"t":"译文"}]}。' +
-                       '只输出合法 JSON，不输出任何其他内容。',
+              content: '你是专业的英中翻译引擎。将用户提供的英文文本逐行翻译为中文。' +
+                       '每行以 [序号] 开头，你只需翻译 [序号] 后面的内容，保持相同的 [序号] 前缀输出。' +
+                       '规则：专有名词保留英文原文（HuggingFace, React, Kubernetes, GitHub 等）；' +
+                       '代码、变量名、URL 不翻译；技术术语用业界通用译法。',
             },
             { role: 'user', content: prompt },
           ],
           temperature: 0.3,
           stream: false,
-          response_format: { type: 'json_object' },
-          max_tokens: 4096,
+          max_tokens: 8192,
         }),
         signal,
       });
@@ -276,68 +276,32 @@ async function translateOneBatch(batch, signal) {
 // ============================================================
 
 function buildPrompt(textLines) {
-  return `将以下英文翻译为中文，规则：
-1. 专有名词保留英文原文（如 HuggingFace, React, Kubernetes, GitHub, TensorFlow, API, HTTP, JSON 等）
-2. 代码、变量名、函数名、API 名、URL、命令 不翻译
-3. 技术术语使用业界通用中文译法（如 machine learning → 机器学习）
-4. 输出自然流畅的简体中文
-
-输出 JSON 格式：{"translations":[{"i":0,"t":"译文"},{"i":1,"t":"译文"}]}
-
-${textLines.join('\n')}`;
+  return textLines.join('\n');
 }
 
 // ============================================================
-// 4 层响应解析容错
+// 纯文本行号解析
 // ============================================================
 
 function parseResponse(content, expectedCount) {
-  let cleaned = content
-    .replace(/^```(?:json)?\s*\n?/i, '')
-    .replace(/\n?```\s*$/i, '')
-    .trim();
-
-  try {
-    const parsed = JSON.parse(cleaned);
-    const arr = parsed.translations || parsed;
-    if (Array.isArray(arr)) return validateTranslations(arr, expectedCount);
-  } catch (e) { /* continue */ }
-
-  const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
-  if (jsonMatch) {
-    try {
-      const arr = JSON.parse(jsonMatch[0]);
-      if (Array.isArray(arr)) return validateTranslations(arr, expectedCount);
-    } catch (e) { /* continue */ }
-  }
-
-  return fallbackParse(cleaned, expectedCount);
-}
-
-function validateTranslations(arr, expectedCount) {
+  const lines = content.split('\n').filter(l => l.trim());
   const result = [];
+
   for (let i = 0; i < expectedCount; i++) {
-    const item = arr.find(x => (x.i === i || x.id === i));
-    if (item) {
-      result.push({ i, t: item.t || item.translated || '' });
-    } else if (arr[i]) {
-      result.push({ i, t: arr[i].t || arr[i].translated || '' });
+    const prefix = `[${i}] `;
+    // 尝试匹配 [序号] 译文 格式
+    const line = lines.find(l => l.startsWith(`[${i}]`));
+    if (line) {
+      result.push({ i, t: line.replace(/^\[\d+\]\s*/, '').trim() });
+    } else if (lines[i]) {
+      // 回退：按行号顺序对应
+      result.push({ i, t: lines[i].replace(/^\[\d+\]\s*/, '').trim() });
     } else {
       result.push({ i, t: '' });
     }
   }
-  return result;
-}
 
-function fallbackParse(text, expectedCount) {
-  const lines = text.split('\n').filter(l => l.trim());
-  if (lines.length >= expectedCount * 0.7) {
-    return lines.slice(0, expectedCount).map((line, i) => ({
-      i,
-      t: line.replace(/^\[\d+\]\s*/, '').replace(/^["']|["']$/g, '').trim(),
-    }));
-  }
-  return Array.from({ length: expectedCount }, (_, i) => ({ i, t: '' }));
+  return result;
 }
 
 // ============================================================
