@@ -264,7 +264,7 @@ async function translateOneBatch(batch, signal) {
       if (err.name === 'AbortError') throw err;
       if (err.status === 401) throw err;
       if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * (attempt + 1));
+        await abortableSleep(RETRY_DELAY_MS * (attempt + 1), signal);
       }
     }
   }
@@ -414,4 +414,19 @@ function broadcastProgress(completed, total, tabId, failedCount = 0) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 可被 AbortSignal 中止的 sleep
+function abortableSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  });
 }
