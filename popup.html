@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <span class="logo">T</span>
+      <h1>DeepSeek 翻译</h1>
+      <span class="version">v1.0</span>
+    </div>
+
+    <!-- API Key -->
+    <div class="section">
+      <label class="label">API Key</label>
+      <div class="input-row">
+        <input type="password" id="apiKeyInput" placeholder="sk-xxxxxxxxxxxxxxxx" autocomplete="off">
+        <button id="toggleKeyBtn" class="btn-icon" title="显示/隐藏">&#128065;</button>
+      </div>
+      <button id="saveKeyBtn" class="btn btn-sm btn-primary">保存</button>
+      <p id="keyStatus" class="hint"></p>
+    </div>
+
+    <!-- Divider -->
+    <hr class="divider">
+
+    <!-- Auto translate toggle -->
+    <div class="toggle-row">
+      <span class="label">自动翻译</span>
+      <label class="switch">
+        <input type="checkbox" id="autoToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <!-- Action buttons -->
+    <div class="section">
+      <button id="translateBtn" class="btn btn-translate" disabled>翻译此页</button>
+      <button id="restoreBtn" class="btn btn-secondary hidden">恢复原文</button>
+    </div>
+
+    <!-- Progress -->
+    <div id="progressSection" class="section hidden">
+      <div class="progress-bar">
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
+      <p id="statusText" class="hint"></p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek 智能翻译",
+  "version": "1.0.0",
+  "description": "基于 DeepSeek LLM 的英文网页智能全文翻译，专有名词不翻译",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["https://api.deepseek.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
