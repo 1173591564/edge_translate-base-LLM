@@ -228,7 +228,7 @@
     try {
       for (let ti = 0; ti < batch.length; ti++) {
         const { node, text } = batch[ti];
-        const translated = translations[ti]?.t;
+        const translated = (translations[ti]?.t || '').replace(/[\u200B-\u200F\uFEFF]/g, '');
 
         if (!translated || translated === text) continue;
 

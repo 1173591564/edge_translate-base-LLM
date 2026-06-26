@@ -185,7 +185,7 @@ function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
     // 通知 Popup 翻译完成
     chrome.runtime.sendMessage({
       type: 'TRANSLATION_COMPLETE',
-      data: { cancelled: state.cancelRequested },
+      data: { cancelled: state.cancelRequested, isIncremental },
     }).catch(() => {});
   })();
 
@@ -215,12 +215,16 @@ async function translateOneBatch(batch, signal) {
           messages: [
             {
               role: 'system',
-              content: '你是专业的英中翻译引擎。只输出合法的 JSON 数组，不输出任何其他内容、不输出 markdown 代码块标记。',
+              content: '你是专业的英中翻译引擎。将用户提供的英文文本翻译为中文，输出 JSON 格式。' +
+                       'JSON 格式为：{"translations":[{"i":0,"t":"译文"}]}。' +
+                       '只输出合法 JSON，不输出任何其他内容。',
             },
             { role: 'user', content: prompt },
           ],
           temperature: 0.3,
           stream: false,
+          response_format: { type: 'json_object' },
+          max_tokens: 4096,
         }),
         signal,
       });
@@ -261,8 +265,7 @@ function buildPrompt(textLines) {
 3. 技术术语使用业界通用中文译法（如 machine learning → 机器学习）
 4. 输出自然流畅的简体中文
 
-严格按以下 JSON 数组格式输出，不要输出任何其他内容：
-[{"i":0,"t":"译文"},{"i":1,"t":"译文"}]
+输出 JSON 格式：{"translations":[{"i":0,"t":"译文"},{"i":1,"t":"译文"}]}
 
 ${textLines.join('\n')}`;
 }
@@ -278,9 +281,10 @@ function parseResponse(content, expectedCount) {
     .replace(/\n?```\s*$/i, '')
     .trim();
 
-  // 第 2 层：直接解析
+  // 第 2 层：直接解析（兼容 {"translations":[...]} 和 [...]）
   try {
-    const arr = JSON.parse(cleaned);
+    const parsed = JSON.parse(cleaned);
+    const arr = parsed.translations || parsed;
     if (Array.isArray(arr)) return validateTranslations(arr, expectedCount);
   } catch (e) { /* continue */ }
 

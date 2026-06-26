@@ -214,10 +214,13 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 
   if (message.type === 'TRANSLATION_COMPLETE') {
+    const { isIncremental } = message.data || {};
     isTranslating = false;
-    isTranslated = true;
-    setProgress(100);
-    setStatus('翻译完成', 'success');
+    if (!isIncremental) {
+      isTranslated = true;
+      setProgress(100);
+      setStatus('翻译完成', 'success');
+    }
     updateUI();
   }
 });
