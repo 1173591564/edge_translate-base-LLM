@@ -455,7 +455,7 @@
     showWidget('working', `翻译中... 0/${blocks.length}`);
 
     try {
-      const resp = await chrome.runtime.sendMessage({ type: 'TRANSLATE', items });
+      const resp = await chrome.runtime.sendMessage({ type: 'TRANSLATE', items, notifyPopup: true });
       if (resp?.error) {
         translating = false;
         showWidget('error', resp.error);
@@ -589,13 +589,16 @@
 
   async function translateIncremental(groups) {
     if (translating) return;
-    // 有新内容→取消空闲完成计时，切回“翻译中”
     clearTimeout(completeTimer);
     completeTimer = null;
     if (translated) {
       translated = false;
-      showWidget('working', `翻译中... ${doneIndices.size}/${pendingBlocks.length}`);
     }
+    // 重置进度跟踪，使增量翻译显示干净的计数
+    doneIndices = new Set();
+    pendingBlocks = [];
+    showWidget('working', `翻译中... 0/${groups.length}`);
+    updateWidgetProgress(0);
     translating = true;
     pendingBlocks.push(...groups);
     const items = buildSendItems(groups);
@@ -644,7 +647,13 @@
       }
 
       case 'ALL_DONE': {
+        const cancelled = msg.data?.cancelled;
         clearTimeout(completeTimer);
+        if (cancelled) {
+          // 用户取消，不跑质量检查，直接释放
+          translating = false;
+          break;
+        }
         if (!translated) {
           // 保持 translating=true 锁住，防止质量检查期间侧栏等动态内容触发并发翻译
           if (qualityRetries < 1) {
@@ -675,16 +684,6 @@
       case 'GET_STATE':
         sendResponse({ translating, translated, count: originalMap.size });
         break;
-    }
-  });
-
-  // SPA URL 变化时重置
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === 'URL_CHANGED') {
-      translated = false;
-      translating = false;
-      clearTimeout(completeTimer);
-      completeTimer = null;
     }
   });
 

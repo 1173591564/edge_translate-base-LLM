@@ -30,7 +30,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.storage.local.set({ autoTranslate }).then(() => sendResponse({ autoTranslate }));
       return true;
     case 'TRANSLATE':
-      ready.then(() => translateStream(msg.items, tabId));
+      ready.then(() => translateStream(msg.items, tabId, msg.notifyPopup));
       sendResponse({ ok: true });
       return true;
     case 'QUALITY_CHECK':
@@ -48,9 +48,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ---- 流式翻译 ----
 const abortControllers = new Map();
 
-async function translateStream(items, tabId) {
+async function translateStream(items, tabId, notifyPopup = false) {
   if (!apiKey) return;
   const controller = new AbortController();
+  const old = abortControllers.get(tabId);
+  if (old) old.abort();
   abortControllers.set(tabId, controller);
 
   try {
@@ -153,8 +155,12 @@ async function translateStream(items, tabId) {
     abortControllers.delete(tabId);
   }
 
-  chrome.tabs.sendMessage(tabId, { type: 'ALL_DONE' }).catch(() => {});
-  chrome.runtime.sendMessage({ type: 'TRANSLATION_COMPLETE' }).catch(() => {});
+  const cancelled = cancelFlags.get(tabId) === true;
+  cancelFlags.delete(tabId);
+  chrome.tabs.sendMessage(tabId, { type: 'ALL_DONE', data: { cancelled } }).catch(() => {});
+  if (notifyPopup) {
+    chrome.runtime.sendMessage({ type: 'TRANSLATION_COMPLETE' }).catch(() => {});
+  }
 }
 
 // ---- 翻译质量检查 ----
