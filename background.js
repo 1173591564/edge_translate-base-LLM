@@ -33,7 +33,8 @@ async function loadState() {
   state.autoTranslate = stored.autoTranslate || false;
 }
 
-loadState();
+// 确保状态加载完成后再处理事件
+const stateReady = loadState();
 
 // ============================================================
 // 消息路由
@@ -305,20 +306,46 @@ function fallbackParse(text, expectedCount) {
 // ============================================================
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  // URL 变化时清除已翻译记录，允许新页面触发自动翻译
+  if (changeInfo.url) {
+    autoTranslatedTabs.delete(tabId);
+  }
+
   if (changeInfo.status !== 'complete') return;
+
+  await stateReady;
   if (!state.autoTranslate || !state.apiKey) return;
 
   // 防止重复翻译
   if (autoTranslatedTabs.has(tabId)) return;
   autoTranslatedTabs.add(tabId);
 
-  // 延迟 800ms 等待 SPA 路由稳定
+  // 延迟 800ms 等待页面 JS 渲染稳定
   await sleep(800);
 
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' });
   } catch (e) {
     // Content script 可能未加载（如 chrome:// 页面）
+  }
+});
+
+// 监听 SPA 路由变化（pushState / replaceState）
+chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
+  if (details.frameId !== 0) return; // 只处理主框架
+
+  await stateReady;
+  if (!state.autoTranslate || !state.apiKey) return;
+
+  // 清除旧记录，允许新路由触发翻译
+  autoTranslatedTabs.delete(details.tabId);
+
+  await sleep(800);
+
+  try {
+    await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' });
+  } catch (e) {
+    // Content script 可能未就绪
   }
 });
 

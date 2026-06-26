@@ -3,7 +3,7 @@
   "name": "DeepSeek 智能翻译",
   "version": "1.0.0",
   "description": "基于 DeepSeek LLM 的英文网页智能全文翻译，专有名词不翻译",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "webNavigation"],
   "host_permissions": ["https://api.deepseek.com/*"],
   "background": {
     "service_worker": "background.js"

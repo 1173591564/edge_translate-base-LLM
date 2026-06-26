@@ -335,6 +335,9 @@
 
     isTranslating = true;
 
+    // 提前启动 MutationObserver，捕捉滚动时懒加载的新内容
+    startObserver();
+
     try {
       // 1. 提取文本节点
       const textNodes = extractTextNodes();
@@ -368,8 +371,7 @@
       isTranslated = true;
       isTranslating = false;
 
-      // 5. 启动 MutationObserver 监听 SPA 动态内容
-      startObserver();
+      // Observer 已在翻译开始时启动，无需再次启动
 
       // 通知 Background 翻译完成
       chrome.runtime.sendMessage({ type: 'TRANSLATION_DONE' });
@@ -436,7 +438,7 @@
         const nodes = pendingNodes.filter(n => document.contains(n));
         pendingNodes = [];
         if (nodes.length > 0) translateIncremental(nodes);
-      }, 1000);
+      }, 600);
     });
 
     observer.observe(document.body, {
@@ -468,6 +470,24 @@
       isTranslating = false;
     }
   }
+
+  // ============================================================
+  // 滚动监听：捕捉 IntersectionObserver 触发的懒加载文本
+  // ============================================================
+
+  let scrollTimer = null;
+  window.addEventListener('scroll', () => {
+    if (!isTranslated || isTranslating || _isApplyingDOM) return;
+    clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => {
+      // 重新扫描，找出未翻译的文本节点
+      const allNodes = extractTextNodes();
+      const unTranslated = allNodes.filter(n =>
+        !n.parentElement?.hasAttribute('data-translated'),
+      );
+      if (unTranslated.length > 0) translateIncremental(unTranslated);
+    }, 500);
+  }, { passive: true });
 
   // ============================================================
   // 消息监听（Content Script 入口）
