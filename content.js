@@ -4,7 +4,6 @@
 // ============================================================
 
 (() => {
-  // 防止重复注入
   if (window.__deepseekTranslator) return;
   window.__deepseekTranslator = true;
 
@@ -21,42 +20,33 @@
 
   const MAX_CHARS_PER_BATCH = 3000;
   const CJK_THRESHOLD = 0.35;
+  const WATCHDOG_TIMEOUT = 5 * 60 * 1000; // 5 分钟
 
   // ============================================================
-  // 原文缓存（用于恢复）
+  // 原文缓存 + 状态
   // ============================================================
 
-  const originalCache = new Map(); // Map<TextNode, { text, parent }>
-
-  // ============================================================
-  // 翻译状态
-  // ============================================================
+  const originalCache = new Map(); // Map<TextNode, string>（仅存文本，不存 parent）
+  const recentTranslated = new WeakMap(); // WeakMap<Node, number>（不阻止 GC）
+  const pendingIncrementalNodes = []; // 翻译期间暂存的新节点
 
   let isTranslating = false;
   let isTranslated = false;
-  let _isApplyingDOM = false; // MutationObserver 内部锁
+  let _isApplyingDOM = false;
   let observer = null;
-  const recentTranslated = new Map(); // Node -> timestamp（循环保护）
-
-  // 渐进式翻译：保存批次引用，等待逐批结果
-  let pendingBatches = []; // Array<Array<{node, text, chunk}>>
+  let watchdogTimer = null;
+  let pendingBatches = [];
 
   // ============================================================
-  // 语言检测（页面级）
+  // 语言检测
   // ============================================================
 
   function detectPageLanguage() {
     const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
+      document.body, NodeFilter.SHOW_TEXT,
       { acceptNode: n => n.textContent.trim().length > 5 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT },
     );
-
-    let sampledChars = 0;
-    let cjkChars = 0;
-    let nodeCount = 0;
-
-    let node;
+    let sampledChars = 0, cjkChars = 0, nodeCount = 0, node;
     while ((node = walker.nextNode()) && nodeCount < 15) {
       const text = node.textContent.trim();
       sampledChars += text.length;
@@ -64,7 +54,6 @@
       if (cjk) cjkChars += cjk.length;
       nodeCount++;
     }
-
     if (sampledChars === 0) return 'empty';
     return (cjkChars / sampledChars) > CJK_THRESHOLD ? 'zh' : 'en';
   }
@@ -85,39 +74,25 @@
 
   function extractTextNodes() {
     const nodes = [];
-
     const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
+      document.body, NodeFilter.SHOW_TEXT,
       {
         acceptNode(node) {
           const text = node.textContent.trim();
-          // 跳过空白/过短
           if (!text || text.length < 3) return NodeFilter.FILTER_REJECT;
-          // 必须包含至少 2 个连续英文字母
           if (!/[a-zA-Z]{2,}/.test(text)) return NodeFilter.FILTER_REJECT;
-
           const parent = node.parentElement;
           if (!parent) return NodeFilter.FILTER_REJECT;
-          // 跳过已翻译的
           if (parent.hasAttribute('data-translated')) return NodeFilter.FILTER_REJECT;
-          // 跳过不可翻译的标签
           if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
-          // 跳过祖先中有 SKIP_TAGS 的
           if (hasSkippedAncestor(parent)) return NodeFilter.FILTER_REJECT;
-          // 跳过 contenteditable
           if (parent.isContentEditable) return NodeFilter.FILTER_REJECT;
-
           return NodeFilter.FILTER_ACCEPT;
         },
       },
     );
-
     let node;
-    while ((node = walker.nextNode())) {
-      nodes.push(node);
-    }
-
+    while ((node = walker.nextNode())) nodes.push(node);
     return nodes;
   }
 
@@ -127,24 +102,19 @@
 
   function createBatches(textNodes) {
     const batches = [];
-    let currentBatch = [];
-    let currentChars = 0;
+    let currentBatch = [], currentChars = 0;
 
     for (const node of textNodes) {
       const text = node.textContent.trim();
       const len = text.length;
 
-      // 超长单节点：强制拆分
       if (len > MAX_CHARS_PER_BATCH) {
-        // 先 flush 当前批次
         if (currentBatch.length > 0) {
           batches.push(currentBatch);
           currentBatch = [];
           currentChars = 0;
         }
-        // 按句子拆分长文本
-        const sentences = splitLongText(text, MAX_CHARS_PER_BATCH);
-        for (const sentence of sentences) {
+        for (const sentence of splitLongText(text, MAX_CHARS_PER_BATCH)) {
           batches.push([{ node, text: sentence, chunk: true }]);
         }
         continue;
@@ -160,16 +130,12 @@
       currentChars += len;
     }
 
-    if (currentBatch.length > 0) {
-      batches.push(currentBatch);
-    }
-
+    if (currentBatch.length > 0) batches.push(currentBatch);
     return batches;
   }
 
   function splitLongText(text, maxLen) {
     const parts = [];
-    // 按段落 → 句子 → 空格优先级拆分
     const paragraphs = text.split(/\n\n+/);
     let current = '';
 
@@ -179,7 +145,6 @@
         current = '';
       }
       if (para.length > maxLen) {
-        // 按句子拆
         const sentences = para.split(/(?<=[.!?])\s+/);
         for (const sent of sentences) {
           if (current.length + sent.length + 1 > maxLen && current) {
@@ -187,13 +152,17 @@
             current = '';
           }
           if (sent.length > maxLen) {
-            // 按空格硬切
             let remaining = sent;
             while (remaining.length > maxLen) {
               const cut = remaining.lastIndexOf(' ', maxLen);
-              if (cut <= 0) break;
-              parts.push(remaining.slice(0, cut).trim());
-              remaining = remaining.slice(cut + 1);
+              if (cut <= 0) {
+                // 无空格时按 maxLen 硬切
+                parts.push(remaining.slice(0, maxLen).trim());
+                remaining = remaining.slice(maxLen);
+              } else {
+                parts.push(remaining.slice(0, cut).trim());
+                remaining = remaining.slice(cut + 1);
+              }
             }
             if (remaining.trim()) {
               if (current.length + remaining.length > maxLen && current) {
@@ -224,7 +193,6 @@
     if (!batch || !translations) return;
 
     _isApplyingDOM = true;
-
     try {
       for (let ti = 0; ti < batch.length; ti++) {
         const { node, text } = batch[ti];
@@ -232,30 +200,27 @@
 
         if (!translated || translated === text) continue;
 
-        // 循环保护：30 秒内不重复翻译同一节点
         const lastTime = recentTranslated.get(node);
         if (lastTime && Date.now() - lastTime < 30000) continue;
 
-        // 检查节点是否仍在 DOM 中
         if (!document.contains(node)) continue;
 
-        // 保存原文（仅首次）
+        // 保存原文（仅首次，不存 parent 引用）
         if (!originalCache.has(node)) {
-          originalCache.set(node, {
-            text: node.textContent,
-            parent: node.parentElement,
-          });
+          originalCache.set(node, node.textContent);
         }
 
-        // 替换文本
-        node.textContent = translated;
+        // 保留原始前后空白
+        const raw = node.textContent;
+        const leading = raw.match(/^\s*/)?.[0] || '';
+        const trailing = raw.match(/\s*$/)?.[0] || '';
+        node.textContent = leading + translated + trailing;
 
-        // 标记父元素
         const parent = node.parentElement;
         if (parent) {
           parent.setAttribute('data-translated', 'true');
           if (!parent.hasAttribute('data-original')) {
-            parent.setAttribute('data-original', originalCache.get(node).text);
+            parent.setAttribute('data-original', originalCache.get(node));
           }
         }
 
@@ -266,12 +231,41 @@
     }
   }
 
-  function finalizeTranslation(isIncremental) {
+  // ============================================================
+  // 翻译完成处理
+  // ============================================================
+
+  function finalizeTranslation(isIncremental, cancelled = false) {
     isTranslating = false;
+    clearTimeout(watchdogTimer);
+    watchdogTimer = null;
+
     if (!isIncremental) {
-      // 主翻译完成：标记已翻译，但不清空 pendingBatches（防止迟到的结果丢失）
-      isTranslated = true;
-      chrome.runtime.sendMessage({ type: 'TRANSLATION_DONE' });
+      if (!cancelled) {
+        isTranslated = true;
+      } else if (originalCache.size > 0) {
+        // 取消但有部分翻译内容
+        isTranslated = true;
+      }
+      // 清空 pendingBatches（主翻译完成）
+      pendingBatches = [];
+      // 清理脱离 DOM 的缓存节点
+      cleanupDeadNodes();
+    }
+
+    // 处理暂存的增量节点
+    if (pendingIncrementalNodes.length > 0) {
+      const pending = pendingIncrementalNodes.splice(0).filter(n => document.contains(n));
+      if (pending.length > 0) {
+        translateIncremental(pending);
+      }
+    }
+  }
+
+  // 清理脱离 DOM 的缓存节点
+  function cleanupDeadNodes() {
+    for (const node of originalCache.keys()) {
+      if (!document.contains(node)) originalCache.delete(node);
     }
   }
 
@@ -282,26 +276,20 @@
   function restoreOriginal() {
     _isApplyingDOM = true;
 
-    // 暂停 MutationObserver
     if (observer) {
       observer.disconnect();
       observer = null;
     }
 
-    let restored = 0;
-    let failed = 0;
+    let restored = 0, failed = 0;
 
     try {
-      for (const [node, data] of originalCache) {
-        if (!document.contains(node)) {
-          failed++;
-          continue;
-        }
-        node.textContent = data.text;
+      for (const [node, originalText] of originalCache) {
+        if (!document.contains(node)) { failed++; continue; }
+        node.textContent = originalText;
         restored++;
       }
 
-      // 清除所有翻译标记
       document.querySelectorAll('[data-translated]').forEach(el => {
         el.removeAttribute('data-translated');
         el.removeAttribute('data-original');
@@ -310,10 +298,12 @@
       _isApplyingDOM = false;
     }
 
-    // 清空缓存
     originalCache.clear();
-    recentTranslated.clear();
+    pendingBatches = [];
+    pendingIncrementalNodes.length = 0;
     isTranslated = false;
+    isTranslating = false;
+    clearTimeout(watchdogTimer);
 
     return { restored, failed };
   }
@@ -325,51 +315,52 @@
   async function startTranslation() {
     if (isTranslating) return { error: '翻译进行中' };
 
-    // 语言检测
     const lang = detectPageLanguage();
     if (lang === 'zh') return { error: '该页面已是中文' };
     if (lang === 'empty') return { error: '未检测到可翻译的内容' };
 
-    // 如果已翻译，先恢复
-    if (isTranslated) {
-      restoreOriginal();
-    }
+    if (isTranslated) restoreOriginal();
 
     isTranslating = true;
 
-    // 提前启动 MutationObserver，捕捉滚动时懒加载的新内容
+    // 看门狗：5 分钟超时自动重置状态
+    watchdogTimer = setTimeout(() => {
+      if (isTranslating) {
+        console.warn('[Translate] Watchdog triggered, resetting state');
+        isTranslating = false;
+        pendingBatches = [];
+      }
+    }, WATCHDOG_TIMEOUT);
+
     startObserver();
 
     try {
-      // 1. 提取文本节点
       const textNodes = extractTextNodes();
       if (textNodes.length === 0) {
+        clearTimeout(watchdogTimer);
+        isTranslating = false;
         return { error: '未检测到可翻译的英文内容' };
       }
 
-      // 2. 分批
       const batches = createBatches(textNodes);
-      const batchPayloads = batches.map(batch =>
-        batch.map(item => ({ text: item.text })),
-      );
+      const batchPayloads = batches.map(batch => batch.map(item => ({ text: item.text })));
 
-      // 3. 保存批次引用，等待逐批结果推送
       pendingBatches = batches;
 
-      // 4. 发送给 Background（立即返回 totalBatches，不等待翻译完成）
       const response = await chrome.runtime.sendMessage({
         type: 'TRANSLATE_BATCHES',
         data: { batches: batchPayloads },
       });
 
       if (response.error) {
+        clearTimeout(watchdogTimer);
         isTranslating = false;
         return { error: response.error };
       }
 
-      // 翻译已启动，结果通过 BATCH_RESULT / ALL_BATCHES_DONE 消息推送
       return { ok: true, nodeCount: textNodes.length, batchCount: batches.length };
     } catch (err) {
+      clearTimeout(watchdogTimer);
       isTranslating = false;
       if (originalCache.size > 0) isTranslated = true;
       return { error: err.message };
@@ -387,7 +378,7 @@
     let debounceTimer = null;
 
     observer = new MutationObserver((mutations) => {
-      if (_isApplyingDOM) return; // 我们自己的 DOM 修改，跳过
+      if (_isApplyingDOM) return;
 
       const newNodes = [];
       for (const mutation of mutations) {
@@ -401,10 +392,8 @@
               }
             }
           } else if (added.nodeType === Node.ELEMENT_NODE) {
-            // 遍历新元素中的文本节点
             const walker = document.createTreeWalker(
-              added,
-              NodeFilter.SHOW_TEXT,
+              added, NodeFilter.SHOW_TEXT,
               {
                 acceptNode(n) {
                   const t = n.textContent.trim();
@@ -433,23 +422,30 @@
       }, 600);
     });
 
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   async function translateIncremental(nodes) {
-    if (isTranslating) return;
+    if (isTranslating) {
+      // 翻译进行中：暂存而非丢弃
+      pendingIncrementalNodes.push(...nodes);
+      return;
+    }
+
     isTranslating = true;
+
+    // 增量翻译也设看门狗
+    watchdogTimer = setTimeout(() => {
+      if (isTranslating) {
+        isTranslating = false;
+        pendingBatches = [];
+      }
+    }, WATCHDOG_TIMEOUT);
 
     try {
       const batches = createBatches(nodes);
-      const batchPayloads = batches.map(batch =>
-        batch.map(item => ({ text: item.text })),
-      );
+      const batchPayloads = batches.map(batch => batch.map(item => ({ text: item.text })));
 
-      // 追加到 pendingBatches（记录偏移量）
       const offset = pendingBatches.length;
       pendingBatches.push(...batches);
 
@@ -459,17 +455,19 @@
       });
 
       if (response?.error) {
+        clearTimeout(watchdogTimer);
         isTranslating = false;
         return;
       }
       // 结果通过 BATCH_RESULT / ALL_BATCHES_DONE 推送
     } catch (e) {
+      clearTimeout(watchdogTimer);
       isTranslating = false;
     }
   }
 
   // ============================================================
-  // 滚动监听：捕捉 IntersectionObserver 触发的懒加载文本
+  // 滚动监听
   // ============================================================
 
   let scrollTimer = null;
@@ -477,17 +475,14 @@
     if (!isTranslated || isTranslating || _isApplyingDOM) return;
     clearTimeout(scrollTimer);
     scrollTimer = setTimeout(() => {
-      // 重新扫描，找出未翻译的文本节点
       const allNodes = extractTextNodes();
-      const unTranslated = allNodes.filter(n =>
-        !n.parentElement?.hasAttribute('data-translated'),
-      );
+      const unTranslated = allNodes.filter(n => !n.parentElement?.hasAttribute('data-translated'));
       if (unTranslated.length > 0) translateIncremental(unTranslated);
     }, 500);
   }, { passive: true });
 
   // ============================================================
-  // 消息监听（Content Script 入口）
+  // 消息监听
   // ============================================================
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -497,6 +492,10 @@
         return true;
 
       case 'RESTORE_ORIGINAL': {
+        // 翻译进行中时先取消
+        if (isTranslating) {
+          chrome.runtime.sendMessage({ type: 'CANCEL_TRANSLATE' });
+        }
         const result = restoreOriginal();
         sendResponse({ ok: true, ...result });
         break;
@@ -506,32 +505,34 @@
         startTranslation().then(result => sendResponse(result));
         return true;
 
-      // 逐批翻译结果推送（渐进式 DOM 替换）
+      case 'CANCEL_TRANSLATE_CONTENT':
+        clearTimeout(watchdogTimer);
+        isTranslating = false;
+        pendingBatches = [];
+        pendingIncrementalNodes.length = 0;
+        sendResponse({ ok: true });
+        break;
+
       case 'BATCH_RESULT': {
         const { batchIndex, translations } = message.data;
         applyBatchResult(batchIndex, translations);
         break;
       }
 
-      // 所有批次完成
       case 'ALL_BATCHES_DONE': {
-        const { isIncremental } = message.data || {};
-        finalizeTranslation(isIncremental);
+        const { isIncremental, cancelled } = message.data || {};
+        finalizeTranslation(isIncremental, cancelled);
         break;
       }
 
       case 'GET_CONTENT_STATE':
-        sendResponse({
-          isTranslating,
-          isTranslated,
-          nodeCount: originalCache.size,
-        });
+        sendResponse({ isTranslating, isTranslated, nodeCount: originalCache.size });
         break;
     }
   });
 
-  // 页面卸载时清理
   window.addEventListener('beforeunload', () => {
     if (observer) observer.disconnect();
+    clearTimeout(watchdogTimer);
   });
 })();

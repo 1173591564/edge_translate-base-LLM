@@ -22,16 +22,16 @@ let hasApiKey = false;
 let isTranslating = false;
 let isTranslated = false;
 let keyMasked = true;
+let activeTabId = null;
+let togglePending = false;
 
 // ============================================================
 // 初始化
 // ============================================================
 
 async function init() {
-  // 从 Background 获取状态
   const bgState = await sendBg('GET_STATE');
-  hasApiKey = bgState.hasApiKey;
-  isTranslating = bgState.translating;
+  hasApiKey = bgState.hasApiKey || false;
 
   if (hasApiKey) {
     els.apiKeyInput.value = 'sk-••••••••••••••••';
@@ -39,22 +39,21 @@ async function init() {
     setKeyStatus('API Key 已配置', 'success');
   }
 
-  els.autoToggle.checked = bgState.autoTranslate;
+  els.autoToggle.checked = bgState.autoTranslate || false;
   updateUI();
 
-  // 获取 Content Script 状态
+  // 获取当前 tabId + Content Script 状态
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.id) {
+      activeTabId = tab.id;
       const contentState = await sendToContentScript(tab.id, { type: 'GET_CONTENT_STATE' });
       if (contentState) {
-        isTranslated = contentState.isTranslated;
-        isTranslating = contentState.isTranslating;
+        isTranslated = contentState.isTranslated || false;
+        isTranslating = contentState.isTranslating || false;
       }
     }
-  } catch (e) {
-    // Content script 未加载
-  }
+  } catch (e) { /* Content script 未加载 */ }
 
   updateUI();
 }
@@ -64,7 +63,6 @@ async function init() {
 // ============================================================
 
 function updateUI() {
-  // 翻译按钮
   if (isTranslating) {
     els.translateBtn.disabled = false;
     els.translateBtn.textContent = '取消翻译';
@@ -122,7 +120,6 @@ els.saveKeyBtn.addEventListener('click', async () => {
 // 显示/隐藏 API Key
 els.toggleKeyBtn.addEventListener('click', () => {
   if (keyMasked) {
-    // 要显示：如果是遮罩值，先清空让用户输入新 Key
     els.apiKeyInput.type = 'text';
     if (els.apiKeyInput.dataset.hasKey === 'true') {
       els.apiKeyInput.value = '';
@@ -138,21 +135,37 @@ els.toggleKeyBtn.addEventListener('click', () => {
   keyMasked = !keyMasked;
 });
 
-// 自动翻译开关
+// 自动翻译开关（防竞态）
 els.autoToggle.addEventListener('change', async () => {
-  const result = await sendBg('TOGGLE_AUTO');
-  els.autoToggle.checked = result.autoTranslate;
+  if (togglePending) {
+    els.autoToggle.checked = !els.autoToggle.checked; // 回滚
+    return;
+  }
+  togglePending = true;
+  els.autoToggle.disabled = true;
+  try {
+    const result = await sendBg('TOGGLE_AUTO');
+    els.autoToggle.checked = result.autoTranslate;
+  } finally {
+    togglePending = false;
+    els.autoToggle.disabled = false;
+  }
 });
 
 // 翻译 / 取消按钮
 els.translateBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
+  activeTabId = tab.id;
 
   if (isTranslating) {
-    // 取消翻译
+    // 取消翻译：通知 background + content.js
     await sendBg('CANCEL_TRANSLATE');
+    try {
+      await sendToContentScript(tab.id, { type: 'CANCEL_TRANSLATE_CONTENT' });
+    } catch (e) { /* ignore */ }
     isTranslating = false;
+    setStatus('翻译已取消', 'warning');
     updateUI();
     return;
   }
@@ -175,7 +188,6 @@ els.translateBtn.addEventListener('click', async () => {
     }
 
     if (result.ok) {
-      // 翻译已启动，结果通过 TRANSLATION_COMPLETE 消息通知
       setStatus(`正在翻译... 0%（${result.batchCount} 批）`, '');
     }
   } catch (err) {
@@ -203,23 +215,34 @@ els.restoreBtn.addEventListener('click', async () => {
 });
 
 // ============================================================
-// 监听 Background 进度推送
+// 监听 Background 进度/完成推送（按 tabId 过滤）
 // ============================================================
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'PROGRESS_UPDATE') {
-    const { completed, total, percent } = message.data;
+    const { completed, total, percent, tabId, failedCount } = message.data;
+    // 仅处理当前活动标签页的消息
+    if (tabId && activeTabId && tabId !== activeTabId) return;
     setProgress(percent);
-    setStatus(`正在翻译... ${percent}%（${completed}/${total} 批）`, '');
+    const failInfo = failedCount > 0 ? `，${failedCount} 批失败` : '';
+    setStatus(`正在翻译... ${percent}%（${completed}/${total} 批${failInfo}）`, '');
   }
 
   if (message.type === 'TRANSLATION_COMPLETE') {
-    const { isIncremental } = message.data || {};
+    const { isIncremental, cancelled, failedCount, tabId } = message.data || {};
+    // 仅处理当前活动标签页的消息
+    if (tabId && activeTabId && tabId !== activeTabId) return;
     isTranslating = false;
     if (!isIncremental) {
-      isTranslated = true;
-      setProgress(100);
-      setStatus('翻译完成', 'success');
+      if (cancelled) {
+        setStatus('翻译已取消', 'warning');
+        isTranslated = false;
+      } else {
+        isTranslated = true;
+        setProgress(100);
+        const failInfo = failedCount > 0 ? `（${failedCount} 批失败）` : '';
+        setStatus(`翻译完成${failInfo}`, 'success');
+      }
     }
     updateUI();
   }
@@ -231,11 +254,13 @@ chrome.runtime.onMessage.addListener((message) => {
 
 function sendBg(type, data = {}) {
   return new Promise(resolve => {
-    chrome.runtime.sendMessage({ type, data }, resolve);
+    chrome.runtime.sendMessage({ type, data }, (response) => {
+      resolve(response || {}); // 防御 undefined
+    });
   });
 }
 
-// Content Script 未就绪时自动重试（最多 3 次，间隔 500ms）
+// Content Script 未就绪时自动重试
 async function sendToContentScript(tabId, message, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {

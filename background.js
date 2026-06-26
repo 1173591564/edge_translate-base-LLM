@@ -9,19 +9,20 @@ const MAX_CONCURRENT = 5;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 1000;
 
-// 全局状态
+// 全局状态（仅持久化 apiKey 和 autoTranslate）
 let state = {
   apiKey: '',
   autoTranslate: false,
-  translating: false,
-  cancelRequested: false,
 };
 
-// 已自动翻译的 tab（防重复）
-const autoTranslatedTabs = new Set();
+// Per-tab AbortController（替代全局单一变量）
+const abortControllers = new Map(); // tabId -> AbortController
 
-// 当前翻译的 AbortController
-let currentAbortController = null;
+// Per-tab 取消标记（替代全局 cancelRequested）
+const cancelFlags = new Map(); // tabId -> boolean
+
+// 已自动翻译的 tab（防重复）
+let autoTranslatedTabs = new Set();
 
 // ============================================================
 // 启动：从 storage 恢复持久状态
@@ -31,10 +32,22 @@ async function loadState() {
   const stored = await chrome.storage.local.get(['apiKey', 'autoTranslate']);
   state.apiKey = stored.apiKey || '';
   state.autoTranslate = stored.autoTranslate || false;
+
+  // 恢复 autoTranslatedTabs
+  const session = await chrome.storage.session.get(['autoTranslatedTabs']);
+  if (session.autoTranslatedTabs) {
+    autoTranslatedTabs = new Set(session.autoTranslatedTabs);
+  }
 }
 
-// 确保状态加载完成后再处理事件
 const stateReady = loadState();
+
+// 持久化 autoTranslatedTabs
+async function saveAutoTranslatedTabs() {
+  await chrome.storage.session.set({
+    autoTranslatedTabs: [...autoTranslatedTabs],
+  });
+}
 
 // ============================================================
 // 消息路由
@@ -42,13 +55,13 @@ const stateReady = loadState();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type, data } = message;
+  const tabId = sender.tab?.id;
 
   switch (type) {
     case 'GET_STATE':
       stateReady.then(() => sendResponse({
         hasApiKey: !!state.apiKey,
         autoTranslate: state.autoTranslate,
-        translating: state.translating,
       }));
       return true;
 
@@ -61,7 +74,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case 'TRANSLATE_BATCHES': {
-      const tabId = sender.tab?.id;
       const offset = data.offset || 0;
       const isIncremental = offset > 0;
       stateReady.then(() => {
@@ -76,16 +88,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     case 'CANCEL_TRANSLATE':
-      if (currentAbortController) {
-        state.cancelRequested = true;
-        currentAbortController.abort();
+      if (tabId) {
+        cancelFlags.set(tabId, true);
+        const controller = abortControllers.get(tabId);
+        if (controller) controller.abort();
       }
       sendResponse({ ok: true });
       break;
 
-    case 'TRANSLATION_DONE':
-      state.translating = false;
-      break;
+    // TRANSLATION_DONE 已移除：IIFE 内自行管理状态
   }
 });
 
@@ -113,12 +124,14 @@ function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
     throw new Error('请先配置 API Key');
   }
 
-  state.translating = true;
-  state.cancelRequested = false;
-  currentAbortController = new AbortController();
+  // Per-tab AbortController
+  const abortController = new AbortController();
+  abortControllers.set(tabId, abortController);
+  cancelFlags.delete(tabId);
 
   const totalBatches = batches.length;
-  let completedCount = 0;
+  let successCount = 0;
+  let failedCount = 0;
 
   // 信号量控制并发
   const semaphore = {
@@ -126,31 +139,25 @@ function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
     max: MAX_CONCURRENT,
     queue: [],
     async acquire() {
-      if (this.count < this.max) {
-        this.count++;
-        return;
-      }
+      if (this.count < this.max) { this.count++; return; }
       return new Promise(resolve => this.queue.push(resolve));
     },
     release() {
       this.count--;
-      if (this.queue.length > 0) {
-        this.count++;
-        this.queue.shift()();
-      }
+      if (this.queue.length > 0) { this.count++; this.queue.shift()(); }
     },
   };
 
-  // 异步执行所有批次，逐批推送结果到 content.js
   (async () => {
     const tasks = batches.map(async (batch, batchIndex) => {
       await semaphore.acquire();
       try {
-        if (state.cancelRequested) return;
+        // Per-tab 取消检查
+        if (cancelFlags.get(tabId)) return;
 
-        const translated = await translateOneBatch(batch, currentAbortController.signal);
+        const translated = await translateOneBatch(batch, abortController.signal);
 
-        // 逐批推送翻译结果到 content.js（渐进式 DOM 替换）
+        // 逐批推送翻译结果到 content.js
         if (tabId) {
           chrome.tabs.sendMessage(tabId, {
             type: 'BATCH_RESULT',
@@ -158,13 +165,19 @@ function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
           }).catch(() => {});
         }
 
-        completedCount++;
-        broadcastProgress(completedCount, totalBatches);
+        successCount++;
+
+        // 增量翻译不广播进度（避免进度条回退）
+        if (!isIncremental) {
+          broadcastProgress(successCount + failedCount, totalBatches, tabId, failedCount);
+        }
       } catch (err) {
         if (err.name === 'AbortError') return;
         console.error(`[Translate] Batch ${batchIndex} failed:`, err);
-        completedCount++;
-        broadcastProgress(completedCount, totalBatches);
+        failedCount++;
+        if (!isIncremental) {
+          broadcastProgress(successCount + failedCount, totalBatches, tabId, failedCount);
+        }
       } finally {
         semaphore.release();
       }
@@ -172,25 +185,28 @@ function kickOffTranslation(batches, tabId, offset = 0, isIncremental = false) {
 
     await Promise.allSettled(tasks);
 
-    state.translating = false;
-    currentAbortController = null;
+    // 仅在当前 controller 仍是自己时清理
+    if (abortControllers.get(tabId) === abortController) {
+      abortControllers.delete(tabId);
+    }
+    cancelFlags.delete(tabId);
 
     // 通知 content.js 所有批次完成
+    const cancelled = cancelFlags.get(tabId) === true;
     if (tabId) {
       chrome.tabs.sendMessage(tabId, {
         type: 'ALL_BATCHES_DONE',
-        data: { totalBatches, cancelled: state.cancelRequested, isIncremental },
+        data: { totalBatches, cancelled, isIncremental, failedCount },
       }).catch(() => {});
     }
 
-    // 通知 Popup 翻译完成
+    // 通知 Popup（携带 tabId 供过滤）
     chrome.runtime.sendMessage({
       type: 'TRANSLATION_COMPLETE',
-      data: { cancelled: state.cancelRequested, isIncremental },
+      data: { cancelled, isIncremental, failedCount, tabId },
     }).catch(() => {});
   })();
 
-  // 立即返回批次总数
   return { ok: true, totalBatches };
 }
 
@@ -276,20 +292,17 @@ ${textLines.join('\n')}`;
 // ============================================================
 
 function parseResponse(content, expectedCount) {
-  // 第 1 层：去掉 markdown 代码块包裹
   let cleaned = content
     .replace(/^```(?:json)?\s*\n?/i, '')
     .replace(/\n?```\s*$/i, '')
     .trim();
 
-  // 第 2 层：直接解析（兼容 {"translations":[...]} 和 [...]）
   try {
     const parsed = JSON.parse(cleaned);
     const arr = parsed.translations || parsed;
     if (Array.isArray(arr)) return validateTranslations(arr, expectedCount);
   } catch (e) { /* continue */ }
 
-  // 第 3 层：正则提取 JSON 数组
   const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
   if (jsonMatch) {
     try {
@@ -298,28 +311,25 @@ function parseResponse(content, expectedCount) {
     } catch (e) { /* continue */ }
   }
 
-  // 第 4 层：尝试逐行提取翻译文本（最后手段）
   return fallbackParse(cleaned, expectedCount);
 }
 
 function validateTranslations(arr, expectedCount) {
   const result = [];
   for (let i = 0; i < expectedCount; i++) {
-    // 支持 {"i":N,"t":"..."} 和 {"id":N,"translated":"..."} 两种格式
     const item = arr.find(x => (x.i === i || x.id === i));
     if (item) {
       result.push({ i, t: item.t || item.translated || '' });
     } else if (arr[i]) {
       result.push({ i, t: arr[i].t || arr[i].translated || '' });
     } else {
-      result.push({ i, t: '' }); // 缺失的保持空串，由 content.js 处理
+      result.push({ i, t: '' });
     }
   }
   return result;
 }
 
 function fallbackParse(text, expectedCount) {
-  // 尝试从每行提取翻译内容
   const lines = text.split('\n').filter(l => l.trim());
   if (lines.length >= expectedCount * 0.7) {
     return lines.slice(0, expectedCount).map((line, i) => ({
@@ -327,7 +337,6 @@ function fallbackParse(text, expectedCount) {
       t: line.replace(/^\[\d+\]\s*/, '').replace(/^["']|["']$/g, '').trim(),
     }));
   }
-  // 完全解析失败，返回原文
   return Array.from({ length: expectedCount }, (_, i) => ({ i, t: '' }));
 }
 
@@ -336,65 +345,67 @@ function fallbackParse(text, expectedCount) {
 // ============================================================
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  // URL 变化时清除已翻译记录，允许新页面触发自动翻译
   if (changeInfo.url) {
     autoTranslatedTabs.delete(tabId);
+    await saveAutoTranslatedTabs();
   }
 
   if (changeInfo.status !== 'complete') return;
 
+  // URL 协议过滤：仅处理 http/https 页面
+  if (!tab.url || !/^https?:\/\//.test(tab.url)) return;
+
   await stateReady;
   if (!state.autoTranslate || !state.apiKey) return;
 
-  // 防止重复翻译
   if (autoTranslatedTabs.has(tabId)) return;
   autoTranslatedTabs.add(tabId);
+  await saveAutoTranslatedTabs();
 
-  // 延迟 800ms 等待页面 JS 渲染稳定
   await sleep(800);
 
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' });
-  } catch (e) {
-    // Content script 可能未加载（如 chrome:// 页面）
-  }
+  } catch (e) { /* Content script 可能未加载 */ }
 });
 
-// 监听 SPA 路由变化（pushState / replaceState）
+// 监听 SPA 路由变化
 chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-  if (details.frameId !== 0) return; // 只处理主框架
+  if (details.frameId !== 0) return;
 
   await stateReady;
   if (!state.autoTranslate || !state.apiKey) return;
 
-  // 清除旧记录，允许新路由触发翻译
   autoTranslatedTabs.delete(details.tabId);
+  await saveAutoTranslatedTabs();
 
   await sleep(800);
 
   try {
     await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' });
-  } catch (e) {
-    // Content script 可能未就绪
-  }
+  } catch (e) { /* Content script 可能未就绪 */ }
 });
 
-// Tab 关闭时清理记录
-chrome.tabs.onRemoved.addListener(tabId => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
   autoTranslatedTabs.delete(tabId);
+  abortControllers.delete(tabId);
+  cancelFlags.delete(tabId);
+  await saveAutoTranslatedTabs();
 });
 
 // ============================================================
-// 进度广播
+// 进度广播（携带 tabId 供 Popup 过滤）
 // ============================================================
 
-function broadcastProgress(completed, total) {
+function broadcastProgress(completed, total, tabId, failedCount = 0) {
   chrome.runtime.sendMessage({
     type: 'PROGRESS_UPDATE',
-    data: { completed, total, percent: Math.round((completed / total) * 100) },
-  }).catch(() => {
-    // Popup 可能已关闭，忽略
-  });
+    data: {
+      completed, total,
+      percent: Math.round((completed / total) * 100),
+      failedCount, tabId,
+    },
+  }).catch(() => {});
 }
 
 // ============================================================
