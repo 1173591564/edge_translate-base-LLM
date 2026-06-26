@@ -18,24 +18,25 @@
     'BR', 'HR', 'IMG', 'META', 'LINK',
   ]);
 
-  const MAX_CHARS_PER_BATCH = 3000;
   const CJK_THRESHOLD = 0.35;
-  const WATCHDOG_TIMEOUT = 5 * 60 * 1000; // 5 分钟
+  const WATCHDOG_TIMEOUT = 5 * 60 * 1000;
 
   // ============================================================
-  // 原文缓存 + 状态
+  // 状态
   // ============================================================
 
-  const originalCache = new Map(); // Map<TextNode, string>（仅存文本，不存 parent）
-  const recentTranslated = new WeakMap(); // WeakMap<Node, number>（不阻止 GC）
-  const pendingIncrementalNodes = []; // 翻译期间暂存的新节点
+  const originalCache = new Map(); // Map<TextNode, string>
+  const recentTranslated = new WeakMap();
+  const pendingIncrementalNodes = [];
 
   let isTranslating = false;
   let isTranslated = false;
   let _isApplyingDOM = false;
   let observer = null;
   let watchdogTimer = null;
-  let pendingBatches = [];
+
+  // 扁平节点列表：pendingNodes[i] = { node, text }
+  let pendingNodes = [];
 
   // ============================================================
   // 语言检测
@@ -97,142 +98,54 @@
   }
 
   // ============================================================
-  // 分批
+  // 逐行 DOM 替换
   // ============================================================
 
-  function createBatches(textNodes) {
-    const batches = [];
-    let currentBatch = [], currentChars = 0;
+  function applyLineResult(lineIndex, translatedText) {
+    const item = pendingNodes[lineIndex];
+    if (!item || !translatedText) return;
 
-    for (const node of textNodes) {
-      const text = node.textContent.trim();
-      const len = text.length;
+    const { node, text } = item;
+    const translated = translatedText.replace(/[\u200B-\u200F\uFEFF]/g, '');
 
-      if (len > MAX_CHARS_PER_BATCH) {
-        if (currentBatch.length > 0) {
-          batches.push(currentBatch);
-          currentBatch = [];
-          currentChars = 0;
-        }
-        for (const sentence of splitLongText(text, MAX_CHARS_PER_BATCH)) {
-          batches.push([{ node, text: sentence, chunk: true }]);
-        }
-        continue;
-      }
+    if (!translated || translated === text) return;
 
-      if (currentChars + len > MAX_CHARS_PER_BATCH && currentBatch.length > 0) {
-        batches.push(currentBatch);
-        currentBatch = [];
-        currentChars = 0;
-      }
+    // 循环保护
+    const lastTime = recentTranslated.get(node);
+    if (lastTime && Date.now() - lastTime < 30000) return;
 
-      currentBatch.push({ node, text, chunk: false });
-      currentChars += len;
+    if (!document.contains(node)) return;
+
+    // 保存原文
+    if (!originalCache.has(node)) {
+      originalCache.set(node, node.textContent);
     }
 
-    if (currentBatch.length > 0) batches.push(currentBatch);
-    return batches;
-  }
-
-  function splitLongText(text, maxLen) {
-    const parts = [];
-    const paragraphs = text.split(/\n\n+/);
-    let current = '';
-
-    for (const para of paragraphs) {
-      if (current.length + para.length + 2 > maxLen && current) {
-        parts.push(current.trim());
-        current = '';
-      }
-      if (para.length > maxLen) {
-        const sentences = para.split(/(?<=[.!?])\s+/);
-        for (const sent of sentences) {
-          if (current.length + sent.length + 1 > maxLen && current) {
-            parts.push(current.trim());
-            current = '';
-          }
-          if (sent.length > maxLen) {
-            let remaining = sent;
-            while (remaining.length > maxLen) {
-              const cut = remaining.lastIndexOf(' ', maxLen);
-              if (cut <= 0) {
-                // 无空格时按 maxLen 硬切
-                parts.push(remaining.slice(0, maxLen).trim());
-                remaining = remaining.slice(maxLen);
-              } else {
-                parts.push(remaining.slice(0, cut).trim());
-                remaining = remaining.slice(cut + 1);
-              }
-            }
-            if (remaining.trim()) {
-              if (current.length + remaining.length > maxLen && current) {
-                parts.push(current.trim());
-                current = '';
-              }
-              current += (current ? ' ' : '') + remaining;
-            }
-          } else {
-            current += (current ? ' ' : '') + sent;
-          }
-        }
-      } else {
-        current += (current ? '\n\n' : '') + para;
-      }
-    }
-
-    if (current.trim()) parts.push(current.trim());
-    return parts;
-  }
-
-  // ============================================================
-  // DOM 替换（单批次渐进式）
-  // ============================================================
-
-  function applyBatchResult(batchIndex, translations) {
-    const batch = pendingBatches[batchIndex];
-    if (!batch || !translations) return;
+    // 保留前后空白
+    const raw = node.textContent;
+    const leading = raw.match(/^\s*/)?.[0] || '';
+    const trailing = raw.match(/\s*$/)?.[0] || '';
 
     _isApplyingDOM = true;
     try {
-      for (let ti = 0; ti < batch.length; ti++) {
-        const { node, text } = batch[ti];
-        const translated = (translations[ti]?.t || '').replace(/[\u200B-\u200F\uFEFF]/g, '');
+      node.textContent = leading + translated + trailing;
 
-        if (!translated || translated === text) continue;
-
-        const lastTime = recentTranslated.get(node);
-        if (lastTime && Date.now() - lastTime < 30000) continue;
-
-        if (!document.contains(node)) continue;
-
-        // 保存原文（仅首次，不存 parent 引用）
-        if (!originalCache.has(node)) {
-          originalCache.set(node, node.textContent);
+      const parent = node.parentElement;
+      if (parent) {
+        parent.setAttribute('data-translated', 'true');
+        if (!parent.hasAttribute('data-original')) {
+          parent.setAttribute('data-original', originalCache.get(node));
         }
-
-        // 保留原始前后空白
-        const raw = node.textContent;
-        const leading = raw.match(/^\s*/)?.[0] || '';
-        const trailing = raw.match(/\s*$/)?.[0] || '';
-        node.textContent = leading + translated + trailing;
-
-        const parent = node.parentElement;
-        if (parent) {
-          parent.setAttribute('data-translated', 'true');
-          if (!parent.hasAttribute('data-original')) {
-            parent.setAttribute('data-original', originalCache.get(node));
-          }
-        }
-
-        recentTranslated.set(node, Date.now());
       }
+
+      recentTranslated.set(node, Date.now());
     } finally {
       _isApplyingDOM = false;
     }
   }
 
   // ============================================================
-  // 翻译完成处理
+  // 翻译完成
   // ============================================================
 
   function finalizeTranslation(isIncremental, cancelled = false) {
@@ -241,28 +154,20 @@
     watchdogTimer = null;
 
     if (!isIncremental) {
-      if (!cancelled) {
-        isTranslated = true;
-      } else if (originalCache.size > 0) {
-        // 取消但有部分翻译内容
+      if (!cancelled || originalCache.size > 0) {
         isTranslated = true;
       }
-      // 清空 pendingBatches（主翻译完成）
-      pendingBatches = [];
-      // 清理脱离 DOM 的缓存节点
+      pendingNodes = [];
       cleanupDeadNodes();
     }
 
     // 处理暂存的增量节点
     if (pendingIncrementalNodes.length > 0) {
       const pending = pendingIncrementalNodes.splice(0).filter(n => document.contains(n));
-      if (pending.length > 0) {
-        translateIncremental(pending);
-      }
+      if (pending.length > 0) translateIncremental(pending);
     }
   }
 
-  // 清理脱离 DOM 的缓存节点
   function cleanupDeadNodes() {
     for (const node of originalCache.keys()) {
       if (!document.contains(node)) originalCache.delete(node);
@@ -275,21 +180,15 @@
 
   function restoreOriginal() {
     _isApplyingDOM = true;
-
-    if (observer) {
-      observer.disconnect();
-      observer = null;
-    }
+    if (observer) { observer.disconnect(); observer = null; }
 
     let restored = 0, failed = 0;
-
     try {
       for (const [node, originalText] of originalCache) {
         if (!document.contains(node)) { failed++; continue; }
         node.textContent = originalText;
         restored++;
       }
-
       document.querySelectorAll('[data-translated]').forEach(el => {
         el.removeAttribute('data-translated');
         el.removeAttribute('data-original');
@@ -299,7 +198,7 @@
     }
 
     originalCache.clear();
-    pendingBatches = [];
+    pendingNodes = [];
     pendingIncrementalNodes.length = 0;
     isTranslated = false;
     isTranslating = false;
@@ -323,12 +222,11 @@
 
     isTranslating = true;
 
-    // 看门狗：5 分钟超时自动重置状态
     watchdogTimer = setTimeout(() => {
       if (isTranslating) {
-        console.warn('[Translate] Watchdog triggered, resetting state');
+        console.warn('[Translate] Watchdog triggered');
         isTranslating = false;
-        pendingBatches = [];
+        pendingNodes = [];
       }
     }, WATCHDOG_TIMEOUT);
 
@@ -342,14 +240,17 @@
         return { error: '未检测到可翻译的英文内容' };
       }
 
-      const batches = createBatches(textNodes);
-      const batchPayloads = batches.map(batch => batch.map(item => ({ text: item.text })));
+      // 扁平列表：每个文本节点一个条目
+      pendingNodes = textNodes.map(node => ({
+        node,
+        text: node.textContent.trim(),
+      }));
 
-      pendingBatches = batches;
+      const items = pendingNodes.map(item => ({ text: item.text }));
 
       const response = await chrome.runtime.sendMessage({
-        type: 'TRANSLATE_BATCHES',
-        data: { batches: batchPayloads },
+        type: 'TRANSLATE_STREAM',
+        data: { items },
       });
 
       if (response.error) {
@@ -358,7 +259,7 @@
         return { error: response.error };
       }
 
-      return { ok: true, nodeCount: textNodes.length, batchCount: batches.length };
+      return { ok: true, nodeCount: textNodes.length };
     } catch (err) {
       clearTimeout(watchdogTimer);
       isTranslating = false;
@@ -368,13 +269,13 @@
   }
 
   // ============================================================
-  // MutationObserver（SPA 兼容）
+  // MutationObserver
   // ============================================================
 
   function startObserver() {
     if (observer) observer.disconnect();
 
-    let pendingNodes = [];
+    let pendingObservedNodes = [];
     let debounceTimer = null;
 
     observer = new MutationObserver((mutations) => {
@@ -413,11 +314,11 @@
 
       if (newNodes.length === 0) return;
 
-      pendingNodes.push(...newNodes);
+      pendingObservedNodes.push(...newNodes);
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        const nodes = pendingNodes.filter(n => document.contains(n));
-        pendingNodes = [];
+        const nodes = pendingObservedNodes.filter(n => document.contains(n));
+        pendingObservedNodes = [];
         if (nodes.length > 0) translateIncremental(nodes);
       }, 600);
     });
@@ -427,39 +328,32 @@
 
   async function translateIncremental(nodes) {
     if (isTranslating) {
-      // 翻译进行中：暂存而非丢弃
       pendingIncrementalNodes.push(...nodes);
       return;
     }
 
     isTranslating = true;
 
-    // 增量翻译也设看门狗
     watchdogTimer = setTimeout(() => {
-      if (isTranslating) {
-        isTranslating = false;
-        pendingBatches = [];
-      }
+      if (isTranslating) { isTranslating = false; pendingNodes = []; }
     }, WATCHDOG_TIMEOUT);
 
     try {
-      const batches = createBatches(nodes);
-      const batchPayloads = batches.map(batch => batch.map(item => ({ text: item.text })));
+      const newItems = nodes.map(node => ({ node, text: node.textContent.trim() }));
+      const offset = pendingNodes.length;
+      pendingNodes.push(...newItems);
 
-      const offset = pendingBatches.length;
-      pendingBatches.push(...batches);
+      const items = newItems.map(item => ({ text: item.text }));
 
       const response = await chrome.runtime.sendMessage({
-        type: 'TRANSLATE_BATCHES',
-        data: { batches: batchPayloads, offset },
+        type: 'TRANSLATE_STREAM',
+        data: { items, isIncremental: true },
       });
 
       if (response?.error) {
         clearTimeout(watchdogTimer);
         isTranslating = false;
-        return;
       }
-      // 结果通过 BATCH_RESULT / ALL_BATCHES_DONE 推送
     } catch (e) {
       clearTimeout(watchdogTimer);
       isTranslating = false;
@@ -492,7 +386,6 @@
         return true;
 
       case 'RESTORE_ORIGINAL': {
-        // 翻译进行中时先取消
         if (isTranslating) {
           chrome.runtime.sendMessage({ type: 'CANCEL_TRANSLATE' });
         }
@@ -508,18 +401,20 @@
       case 'CANCEL_TRANSLATE_CONTENT':
         clearTimeout(watchdogTimer);
         isTranslating = false;
-        pendingBatches = [];
+        pendingNodes = [];
         pendingIncrementalNodes.length = 0;
         sendResponse({ ok: true });
         break;
 
-      case 'BATCH_RESULT': {
-        const { batchIndex, translations } = message.data;
-        applyBatchResult(batchIndex, translations);
+      // 流式逐行结果
+      case 'LINE_RESULT': {
+        const { lineIndex, translated } = message.data;
+        applyLineResult(lineIndex, translated);
         break;
       }
 
-      case 'ALL_BATCHES_DONE': {
+      // 全部完成
+      case 'ALL_DONE': {
         const { isIncremental, cancelled } = message.data || {};
         finalizeTranslation(isIncremental, cancelled);
         break;
