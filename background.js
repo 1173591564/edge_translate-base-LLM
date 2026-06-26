@@ -21,13 +21,22 @@ async function loadState() {
   const stored = await chrome.storage.local.get(['apiKey', 'autoTranslate']);
   state.apiKey = stored.apiKey || '';
   state.autoTranslate = stored.autoTranslate || false;
-  const session = await chrome.storage.session.get(['autoTranslatedTabs']);
-  if (session.autoTranslatedTabs) autoTranslatedTabs = new Set(session.autoTranslatedTabs);
+  // chrome.storage.session 可能不可用，用 try-catch 保护
+  try {
+    const session = await chrome.storage.session.get(['autoTranslatedTabs']);
+    if (session.autoTranslatedTabs) autoTranslatedTabs = new Set(session.autoTranslatedTabs);
+  } catch (e) {
+    // 降级为内存存储
+  }
 }
-const stateReady = loadState();
+const stateReady = loadState().catch(err => {
+  console.error('[BG] loadState failed:', err);
+});
 
 async function saveAutoTranslatedTabs() {
-  await chrome.storage.session.set({ autoTranslatedTabs: [...autoTranslatedTabs] });
+  try {
+    await chrome.storage.session.set({ autoTranslatedTabs: [...autoTranslatedTabs] });
+  } catch (e) { /* 降级为内存存储 */ }
 }
 
 // ============================================================
@@ -142,9 +151,10 @@ function kickOffStreamTranslation(items, tabId, isIncremental) {
       // SSE 流式解析：逐 chunk 读取，检测完整 [N] 行后推送
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = '';
-      let fullText = '';
+      let sseBuffer = '';
+      let currentLine = ''; // 累积当前行文本
       let lastPushedIndex = -1;
+      let lineCount = 0; // 已检测到的完整行数
 
       while (true) {
         if (cancelFlags.get(tabId)) break;
@@ -152,12 +162,12 @@ function kickOffStreamTranslation(items, tabId, isIncremental) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const bufferLines = buffer.split('\n');
-        buffer = bufferLines.pop(); // 保留不完整的行
+        sseBuffer += decoder.decode(value, { stream: true });
+        const sseLines = sseBuffer.split('\n');
+        sseBuffer = sseLines.pop();
 
-        for (const line of bufferLines) {
-          const trimmed = line.trim();
+        for (const sseLine of sseLines) {
+          const trimmed = sseLine.trim();
           if (!trimmed.startsWith('data: ')) continue;
           const jsonStr = trimmed.slice(6);
           if (jsonStr === '[DONE]') continue;
@@ -165,31 +175,32 @@ function kickOffStreamTranslation(items, tabId, isIncremental) {
           try {
             const parsed = JSON.parse(jsonStr);
             const delta = parsed.choices?.[0]?.delta?.content;
-            if (delta) {
-              fullText += delta;
+            if (!delta) continue;
 
-              // 检测完整的 [N] 行并推送
-              const allLines = fullText.split('\n');
-              for (let li = lastPushedIndex + 1; li < allLines.length - 1; li++) {
-                const match = allLines[li].match(/^\[(\d+)\]\s*(.*)/);
-                if (match) {
-                  const lineIndex = parseInt(match[1]);
-                  const translatedText = match[2].trim();
-                  if (lineIndex >= 0 && lineIndex < totalCount) {
-                    successCount++;
-                    // 推送单行结果到 content.js
-                    if (tabId) {
-                      chrome.tabs.sendMessage(tabId, {
-                        type: 'LINE_RESULT',
-                        data: { lineIndex, translated: translatedText },
-                      }).catch(() => {});
-                    }
-                    // 广播进度
-                    if (!isIncremental) {
-                      broadcastProgress(successCount + failedCount, totalCount, tabId, failedCount);
-                    }
+            // 逐字符处理 delta，检测换行符切分行
+            currentLine += delta;
+            while (true) {
+              const nlIdx = currentLine.indexOf('\n');
+              if (nlIdx === -1) break;
+
+              const completeLine = currentLine.slice(0, nlIdx);
+              currentLine = currentLine.slice(nlIdx + 1);
+
+              const match = completeLine.match(/^\[(\d+)\]\s*(.*)/);
+              if (match) {
+                const lineIndex = parseInt(match[1]);
+                const translatedText = match[2].trim();
+                if (lineIndex >= 0 && lineIndex < totalCount) {
+                  successCount++;
+                  if (tabId) {
+                    chrome.tabs.sendMessage(tabId, {
+                      type: 'LINE_RESULT',
+                      data: { lineIndex, translated: translatedText },
+                    }).catch(() => {});
                   }
-                  lastPushedIndex = li;
+                  if (!isIncremental) {
+                    broadcastProgress(successCount + failedCount, totalCount, tabId, failedCount);
+                  }
                 }
               }
             }
@@ -197,25 +208,22 @@ function kickOffStreamTranslation(items, tabId, isIncremental) {
         }
       }
 
-      // 处理最后一行（可能没有换行符结尾）
-      if (fullText) {
-        const allLines = fullText.split('\n');
-        for (let li = lastPushedIndex + 1; li < allLines.length; li++) {
-          const match = allLines[li].match(/^\[(\d+)\]\s*(.*)/);
-          if (match) {
-            const lineIndex = parseInt(match[1]);
-            const translatedText = match[2].trim();
-            if (lineIndex >= 0 && lineIndex < totalCount) {
-              successCount++;
-              if (tabId) {
-                chrome.tabs.sendMessage(tabId, {
-                  type: 'LINE_RESULT',
-                  data: { lineIndex, translated: translatedText },
-                }).catch(() => {});
-              }
-              if (!isIncremental) {
-                broadcastProgress(successCount + failedCount, totalCount, tabId, failedCount);
-              }
+      // 处理最后一行（无换行符结尾）
+      if (currentLine.trim()) {
+        const match = currentLine.match(/^\[(\d+)\]\s*(.*)/);
+        if (match) {
+          const lineIndex = parseInt(match[1]);
+          const translatedText = match[2].trim();
+          if (lineIndex >= 0 && lineIndex < totalCount) {
+            successCount++;
+            if (tabId) {
+              chrome.tabs.sendMessage(tabId, {
+                type: 'LINE_RESULT',
+                data: { lineIndex, translated: translatedText },
+              }).catch(() => {});
+            }
+            if (!isIncremental) {
+              broadcastProgress(successCount + failedCount, totalCount, tabId, failedCount);
             }
           }
         }
@@ -267,8 +275,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (autoTranslatedTabs.has(tabId)) return;
   autoTranslatedTabs.add(tabId);
   await saveAutoTranslatedTabs();
-  await sleep(800);
-  try { await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' }); } catch (e) {}
+  await sleep(1500);
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' });
+  } catch (e) {
+    // Content script 未就绪，重试一次
+    await sleep(500);
+    try { await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' }); } catch (e2) {}
+  }
 });
 
 chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
@@ -277,8 +291,13 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
   if (!state.autoTranslate || !state.apiKey) return;
   autoTranslatedTabs.delete(details.tabId);
   await saveAutoTranslatedTabs();
-  await sleep(800);
-  try { await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' }); } catch (e) {}
+  await sleep(1500);
+  try {
+    await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' });
+  } catch (e) {
+    await sleep(500);
+    try { await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' }); } catch (e2) {}
+  }
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
