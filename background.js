@@ -1,335 +1,186 @@
-// ============================================================
 // DeepSeek 智能翻译 - Background Service Worker
-// 职责：API Key 安全管理 + DeepSeek API 流式调用
-// ============================================================
-
 const API_URL = 'https://api.deepseek.com/chat/completions';
-const MODEL = 'deepseek-v4-flash';
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 1000;
+const MODEL = 'deepseek-chat';
 
-let state = { apiKey: '', autoTranslate: false };
-const abortControllers = new Map();
-const cancelFlags = new Map();
-let autoTranslatedTabs = new Set();
+let apiKey = '';
+let autoTranslate = false;
+const autoTranslatedTabs = new Set();
 
-// ============================================================
-// 启动
-// ============================================================
-
+// ---- 启动 ----
 async function loadState() {
-  const stored = await chrome.storage.local.get(['apiKey', 'autoTranslate']);
-  state.apiKey = stored.apiKey || '';
-  state.autoTranslate = stored.autoTranslate || false;
-  // chrome.storage.session 可能不可用，用 try-catch 保护
-  try {
-    const session = await chrome.storage.session.get(['autoTranslatedTabs']);
-    if (session.autoTranslatedTabs) autoTranslatedTabs = new Set(session.autoTranslatedTabs);
-  } catch (e) {
-    // 降级为内存存储
-  }
+  const s = await chrome.storage.local.get(['apiKey', 'autoTranslate']);
+  apiKey = s.apiKey || '';
+  autoTranslate = s.autoTranslate || false;
 }
-const stateReady = loadState().catch(err => {
-  console.error('[BG] loadState failed:', err);
-});
+const ready = loadState().catch(() => {});
 
-async function saveAutoTranslatedTabs() {
-  try {
-    await chrome.storage.session.set({ autoTranslatedTabs: [...autoTranslatedTabs] });
-  } catch (e) { /* 降级为内存存储 */ }
-}
-
-// ============================================================
-// 消息路由
-// ============================================================
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const { type, data } = message;
+// ---- 消息路由 ----
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab?.id;
-
-  switch (type) {
+  switch (msg.type) {
     case 'GET_STATE':
-      stateReady.then(() => sendResponse({ hasApiKey: !!state.apiKey, autoTranslate: state.autoTranslate }));
+      ready.then(() => sendResponse({ hasApiKey: !!apiKey, autoTranslate }));
       return true;
-
     case 'SAVE_API_KEY':
-      handleSaveApiKey(data.apiKey).then(() => sendResponse({ ok: true }));
+      apiKey = msg.apiKey;
+      chrome.storage.local.set({ apiKey }).then(() => sendResponse({ ok: true }));
       return true;
-
     case 'TOGGLE_AUTO':
-      handleToggleAuto().then(result => sendResponse(result));
+      autoTranslate = !autoTranslate;
+      chrome.storage.local.set({ autoTranslate }).then(() => sendResponse({ autoTranslate }));
       return true;
-
-    case 'TRANSLATE_STREAM': {
-      const isIncremental = data.isIncremental || false;
-      stateReady.then(() => {
-        try {
-          kickOffStreamTranslation(data.items, tabId, isIncremental);
-          sendResponse({ ok: true, count: data.items.length });
-        } catch (err) {
-          sendResponse({ error: err.message });
-        }
-      });
+    case 'TRANSLATE':
+      ready.then(() => translateStream(msg.items, tabId));
+      sendResponse({ ok: true });
       return true;
-    }
-
-    case 'CANCEL_TRANSLATE':
-      if (tabId) {
-        cancelFlags.set(tabId, true);
-        const controller = abortControllers.get(tabId);
-        if (controller) controller.abort();
-      }
+    case 'CANCEL': {
+      const ctrl = abortControllers.get(tabId);
+      if (ctrl) ctrl.abort();
       sendResponse({ ok: true });
       break;
+    }
   }
 });
 
-async function handleSaveApiKey(apiKey) {
-  state.apiKey = apiKey;
-  await chrome.storage.local.set({ apiKey });
-}
+// ---- 流式翻译 ----
+const abortControllers = new Map();
 
-async function handleToggleAuto() {
-  state.autoTranslate = !state.autoTranslate;
-  await chrome.storage.local.set({ autoTranslate: state.autoTranslate });
-  return { autoTranslate: state.autoTranslate };
-}
+async function translateStream(items, tabId) {
+  if (!apiKey) return;
+  const controller = new AbortController();
+  abortControllers.set(tabId, controller);
 
-// ============================================================
-// 流式翻译（单次 API 调用，逐行推送结果）
-// ============================================================
+  try {
+    const lines = items.map((it, i) => `[${i}] ${it.text}`);
 
-function kickOffStreamTranslation(items, tabId, isIncremental) {
-  if (!state.apiKey) throw new Error('请先配置 API Key');
+    const resp = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          {
+            role: 'system',
+            content:
+              '你是专业的英中翻译引擎。将用户提供的英文文本逐条翻译为中文。\n' +
+              '每条以 [序号] 开头，你只需翻译 [序号] 后面的内容，保持相同的 [序号] 前缀输出。\n' +
+              '严格要求：\n' +
+              '1. 输入 N 条就输出 N 条，每条对应相同序号，不得多出任何条目\n' +
+              '2. 每条只输出译文本身，不得添加解释、注释、括号说明或任何额外文字\n' +
+              '3. 不得拆分或合并条目，不得在译文内使用换行\n' +
+              '4. 忠实原文含义，不增不减；专有名词保留英文原文；代码、变量名、URL 不翻译\n' +
+              '5. 技术术语用业界通用译法；保持自然流畅的中文表达\n' +
+              '6. 原文中若含 «N»...«/N» 格式的标记，这是内联格式边界标记，必须在译文中原样保留对应位置，不得删除、修改或翻译这些标记',
+          },
+          { role: 'user', content: lines.join('\n') },
+        ],
+        temperature: 0.3,
+        stream: true,
+        max_tokens: 16384,
+      }),
+      signal: controller.signal,
+    });
 
-  const abortController = new AbortController();
-  abortControllers.set(tabId, abortController);
-  cancelFlags.delete(tabId);
+    if (!resp.ok) throw new Error(`API ${resp.status}`);
 
-  const totalCount = items.length;
+    // SSE 解析：逐 chunk 读取，检测 [N] 行后推送给 content.js
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let currentLine = '';
 
-  (async () => {
-    let successCount = 0;
-    let failedCount = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    try {
-      // 构造 prompt：每行 [序号] 原文
-      const lines = items.map((item, i) => `[${i}] ${item.text}`);
-      const prompt = lines.join('\n');
+      buf += decoder.decode(value, { stream: true });
+      const sseLines = buf.split('\n');
+      buf = sseLines.pop();
 
-      const response = await fetch(API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${state.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            {
-              role: 'system',
-              content: '你是专业的英中翻译引擎。将用户提供的英文文本逐行翻译为中文。' +
-                       '每行以 [序号] 开头，你只需翻译 [序号] 后面的内容，保持相同的 [序号] 前缀输出。' +
-                       '规则：专有名词保留英文原文（HuggingFace, React, Kubernetes, GitHub 等）；' +
-                       '代码、变量名、URL 不翻译；技术术语用业界通用译法。',
-            },
-            { role: 'user', content: prompt },
-          ],
-          temperature: 0.3,
-          stream: true,
-          thinking: { type: 'disabled' },
-          max_tokens: 16384,
-        }),
-        signal: abortController.signal,
-      });
+      for (const sseLine of sseLines) {
+        const trimmed = sseLine.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const jsonStr = trimmed.slice(6);
+        if (jsonStr === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (!delta) continue;
 
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`API ${response.status}: ${errText}`);
-      }
-
-      // SSE 流式解析：逐 chunk 读取，检测完整 [N] 行后推送
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let sseBuffer = '';
-      let currentLine = ''; // 累积当前行文本
-      let lastPushedIndex = -1;
-      let lineCount = 0; // 已检测到的完整行数
-
-      while (true) {
-        if (cancelFlags.get(tabId)) break;
-
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        sseBuffer += decoder.decode(value, { stream: true });
-        const sseLines = sseBuffer.split('\n');
-        sseBuffer = sseLines.pop();
-
-        for (const sseLine of sseLines) {
-          const trimmed = sseLine.trim();
-          if (!trimmed.startsWith('data: ')) continue;
-          const jsonStr = trimmed.slice(6);
-          if (jsonStr === '[DONE]') continue;
-
-          try {
-            const parsed = JSON.parse(jsonStr);
-            const delta = parsed.choices?.[0]?.delta?.content;
-            if (!delta) continue;
-
-            // 逐字符处理 delta，检测换行符切分行
-            currentLine += delta;
-            while (true) {
-              const nlIdx = currentLine.indexOf('\n');
-              if (nlIdx === -1) break;
-
-              const completeLine = currentLine.slice(0, nlIdx);
-              currentLine = currentLine.slice(nlIdx + 1);
-
-              const match = completeLine.match(/^\[(\d+)\]\s*(.*)/);
-              if (match) {
-                const lineIndex = parseInt(match[1]);
-                const translatedText = match[2].trim();
-                if (lineIndex >= 0 && lineIndex < totalCount) {
-                  successCount++;
-                  if (tabId) {
-                    chrome.tabs.sendMessage(tabId, {
-                      type: 'LINE_RESULT',
-                      data: { lineIndex, translated: translatedText },
-                    }).catch(() => {});
-                  }
-                  if (!isIncremental) {
-                    broadcastProgress(successCount + failedCount, totalCount, tabId, failedCount);
-                  }
-                }
+          currentLine += delta;
+          while (true) {
+            const nl = currentLine.indexOf('\n');
+            if (nl === -1) break;
+            const line = currentLine.slice(0, nl);
+            currentLine = currentLine.slice(nl + 1);
+            const m = line.match(/^\[(\d+)\]\s*(.*)/);
+            if (m) {
+              const idx = parseInt(m[1]);
+              if (idx >= 0 && idx < items.length) {
+                chrome.tabs.sendMessage(tabId, {
+                  type: 'LINE_RESULT',
+                  data: { lineIndex: idx, translated: m[2].trim() },
+                }).catch(() => {});
               }
             }
-          } catch (e) { /* 忽略不完整 JSON */ }
-        }
-      }
-
-      // 处理最后一行（无换行符结尾）
-      if (currentLine.trim()) {
-        const match = currentLine.match(/^\[(\d+)\]\s*(.*)/);
-        if (match) {
-          const lineIndex = parseInt(match[1]);
-          const translatedText = match[2].trim();
-          if (lineIndex >= 0 && lineIndex < totalCount) {
-            successCount++;
-            if (tabId) {
-              chrome.tabs.sendMessage(tabId, {
-                type: 'LINE_RESULT',
-                data: { lineIndex, translated: translatedText },
-              }).catch(() => {});
-            }
-            if (!isIncremental) {
-              broadcastProgress(successCount + failedCount, totalCount, tabId, failedCount);
-            }
           }
-        }
-      }
-
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.error('[Translate] Stream failed:', err);
-        failedCount = totalCount - successCount;
+        } catch {}
       }
     }
 
-    // 清理
-    if (abortControllers.get(tabId) === abortController) {
-      abortControllers.delete(tabId);
+    // 处理最后一行（无换行结尾）
+    const m = currentLine.trim().match(/^\[(\d+)\]\s*(.*)/);
+    if (m) {
+      const idx = parseInt(m[1]);
+      if (idx >= 0 && idx < items.length) {
+        chrome.tabs.sendMessage(tabId, {
+          type: 'LINE_RESULT',
+          data: { lineIndex: idx, translated: m[2].trim() },
+        }).catch(() => {});
+      }
     }
-    const cancelled = cancelFlags.get(tabId) === true;
-    cancelFlags.delete(tabId);
-
-    // 通知 content.js 完成
-    if (tabId) {
-      chrome.tabs.sendMessage(tabId, {
-        type: 'ALL_DONE',
-        data: { cancelled, isIncremental, failedCount, totalCount },
-      }).catch(() => {});
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      chrome.tabs.sendMessage(tabId, { type: 'TRANSLATE_ERROR', error: err.message }).catch(() => {});
     }
+  } finally {
+    abortControllers.delete(tabId);
+  }
 
-    // 通知 Popup
-    chrome.runtime.sendMessage({
-      type: 'TRANSLATION_COMPLETE',
-      data: { cancelled, isIncremental, failedCount, tabId },
-    }).catch(() => {});
-  })();
+  chrome.tabs.sendMessage(tabId, { type: 'ALL_DONE' }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'TRANSLATION_COMPLETE' }).catch(() => {});
 }
 
-// ============================================================
-// 自动翻译
-// ============================================================
-
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.url) {
-    autoTranslatedTabs.delete(tabId);
-    await saveAutoTranslatedTabs();
-  }
-  if (changeInfo.status !== 'complete') return;
+// ---- 自动翻译 ----
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (info.url) autoTranslatedTabs.delete(tabId);
+  if (info.status !== 'complete') return;
   if (!tab.url || !/^https?:\/\//.test(tab.url)) return;
-  await stateReady;
-  if (!state.autoTranslate || !state.apiKey) return;
+  await ready;
+  if (!autoTranslate || !apiKey) return;
   if (autoTranslatedTabs.has(tabId)) return;
   autoTranslatedTabs.add(tabId);
-  await saveAutoTranslatedTabs();
-  // 等待页面 DOM 稳定后再触发翻译（而非固定延迟）
-  await waitForDomStable(tabId);
-  try {
-    await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' });
-  } catch (e) {
-    await sleep(500);
-    try { await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' }); } catch (e2) {}
-  }
+  await sleep(1500);
+  try { await chrome.tabs.sendMessage(tabId, { type: 'AUTO_TRANSLATE' }); } catch {}
 });
 
-chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  await stateReady;
-  if (!state.autoTranslate || !state.apiKey) return;
-  autoTranslatedTabs.delete(details.tabId);
-  await saveAutoTranslatedTabs();
-  await waitForDomStable(details.tabId);
-  try {
-    await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' });
-  } catch (e) {
-    await sleep(500);
-    try { await chrome.tabs.sendMessage(details.tabId, { type: 'AUTO_TRANSLATE' }); } catch (e2) {}
-  }
+chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
+  if (d.frameId !== 0) return;
+  await ready;
+  if (!autoTranslate || !apiKey) return;
+  autoTranslatedTabs.delete(d.tabId);
+  await sleep(1500);
+  try { await chrome.tabs.sendMessage(d.tabId, { type: 'AUTO_TRANSLATE' }); } catch {}
 });
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
+chrome.tabs.onRemoved.addListener((tabId) => {
   autoTranslatedTabs.delete(tabId);
   abortControllers.delete(tabId);
-  cancelFlags.delete(tabId);
-  await saveAutoTranslatedTabs();
 });
 
-// ============================================================
-// 工具函数
-// ============================================================
-
-function broadcastProgress(completed, total, tabId, failedCount = 0) {
-  chrome.runtime.sendMessage({
-    type: 'PROGRESS_UPDATE',
-    data: { completed, total, percent: Math.round((completed / total) * 100), failedCount, tabId },
-  }).catch(() => {});
-}
-
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// 等待页面 DOM 稳定：先等 2 秒初始渲染，再检测 DOM 是否还在变化
-async function waitForDomStable(tabId) {
-  await sleep(2000);
-  for (let i = 0; i < 3; i++) {
-    try {
-      const result = await chrome.tabs.sendMessage(tabId, { type: 'CHECK_READY' });
-      if (result?.ready) break;
-    } catch (e) { break; }
-    await sleep(1000);
-  }
+  return new Promise(r => setTimeout(r, ms));
 }
