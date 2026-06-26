@@ -46,7 +46,7 @@ async function init() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.id) {
-      const contentState = await chrome.tabs.sendMessage(tab.id, { type: 'GET_CONTENT_STATE' });
+      const contentState = await sendToContentScript(tab.id, { type: 'GET_CONTENT_STATE' });
       if (contentState) {
         isTranslated = contentState.isTranslated;
         isTranslating = contentState.isTranslating;
@@ -165,7 +165,7 @@ els.translateBtn.addEventListener('click', async () => {
   setStatus('正在翻译... 0%', '');
 
   try {
-    const result = await chrome.tabs.sendMessage(tab.id, { type: 'START_TRANSLATE' });
+    const result = await sendToContentScript(tab.id, { type: 'START_TRANSLATE' });
 
     if (result.error) {
       isTranslating = false;
@@ -191,7 +191,7 @@ els.restoreBtn.addEventListener('click', async () => {
   if (!tab?.id) return;
 
   try {
-    const result = await chrome.tabs.sendMessage(tab.id, { type: 'RESTORE_ORIGINAL' });
+    const result = await sendToContentScript(tab.id, { type: 'RESTORE_ORIGINAL' });
     isTranslated = false;
     isTranslating = false;
     els.progressSection.classList.add('hidden');
@@ -233,6 +233,21 @@ function sendBg(type, data = {}) {
   return new Promise(resolve => {
     chrome.runtime.sendMessage({ type, data }, resolve);
   });
+}
+
+// Content Script 未就绪时自动重试（最多 3 次，间隔 500ms）
+async function sendToContentScript(tabId, message, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (e) {
+      if (i < retries - 1) {
+        await new Promise(r => setTimeout(r, 500));
+      } else {
+        throw e;
+      }
+    }
+  }
 }
 
 // 启动

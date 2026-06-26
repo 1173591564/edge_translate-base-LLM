@@ -45,12 +45,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   switch (type) {
     case 'GET_STATE':
-      sendResponse({
+      stateReady.then(() => sendResponse({
         hasApiKey: !!state.apiKey,
         autoTranslate: state.autoTranslate,
         translating: state.translating,
-      });
-      break;
+      }));
+      return true;
 
     case 'SAVE_API_KEY':
       handleSaveApiKey(data.apiKey).then(() => sendResponse({ ok: true }));
@@ -64,14 +64,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const tabId = sender.tab?.id;
       const offset = data.offset || 0;
       const isIncremental = offset > 0;
-      // 立即返回确认，翻译结果通过 BATCH_RESULT / ALL_BATCHES_DONE 推送
-      try {
-        const info = kickOffTranslation(data.batches, tabId, offset, isIncremental);
-        sendResponse(info);
-      } catch (err) {
-        sendResponse({ error: err.message });
-      }
-      break;
+      stateReady.then(() => {
+        try {
+          const info = kickOffTranslation(data.batches, tabId, offset, isIncremental);
+          sendResponse(info);
+        } catch (err) {
+          sendResponse({ error: err.message });
+        }
+      });
+      return true;
     }
 
     case 'CANCEL_TRANSLATE':
