@@ -241,6 +241,7 @@ async function translateOneBatch(batch, signal) {
           ],
           temperature: 0.3,
           stream: false,
+          thinking: { type: 'disabled' },
           max_tokens: 8192,
         }),
         signal,
