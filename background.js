@@ -4,7 +4,7 @@
 // ============================================================
 
 const API_URL = 'https://api.deepseek.com/chat/completions';
-const MODEL = 'deepseek-chat';
+const MODEL = 'deepseek-v4-flash';
 const MAX_CONCURRENT = 5;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 1000;
